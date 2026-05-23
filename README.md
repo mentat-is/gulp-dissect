@@ -35,9 +35,10 @@ cd gulp-dissect
 
 2026-05-23 17:28:24,623|gulp-dissect||DEBUG|28599,28599|_reconfigure|"muty/log.py", line 245|logger "<TraceLogger gulp-dissect (DEBUG)>" configured!
 usage: gulp-dissect [-h] [--image_path IMAGE_PATH] [--username USERNAME] [--password PASSWORD] [--gulp_url GULP_URL]
-                    [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk_size CHUNK_SIZE] [--context_id CONTEXT_ID]
-                    [--source_id SOURCE_ID] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT] [--reset-operation]
-                    [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS] [--extract_rules EXTRACT_RULES]
+                    [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk_size CHUNK_SIZE] [--context_name CONTEXT_NAME]
+                    [--source_name SOURCE_NAME] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT]
+                    [--reset-operation] [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS]
+                    [--extract_rules EXTRACT_RULES]
 
 Extract data from a forensic image with Dissect and ingest mapped records into gULP via ingest_raw.
 
@@ -53,12 +54,12 @@ options:
   --limit LIMIT         maximum number of records to ingest across all extract tuples; 0 means no limit (default: None)
   --chunk_size CHUNK_SIZE
                         number of mapped records sent per ingest_raw chunk (default: None)
-  --context_id CONTEXT_ID
-                        explicit existing context id; if omitted, mapping must provide an is_gulp_type=context_name field
+  --context_name CONTEXT_NAME
+                        explicit context name override; if omitted, mapping must provide an is_gulp_type=context_name field
                         (default: None)
-  --source_id SOURCE_ID
-                        explicit existing source id; if omitted, mapping must provide an is_gulp_type=source_name field (default:
-                        None)
+  --source_name SOURCE_NAME
+                        explicit source name override; if omitted, mapping must provide an is_gulp_type=source_name field
+                        (default: None)
   --mapping_files_base_path MAPPING_FILES_BASE_PATH
                         base path used to resolve relative mapping file paths (or set GULP_DISSECT_MAPPING_FILES_BASE_PATH)
                         (default: None)
@@ -82,6 +83,8 @@ Environment variables are supported only for:
 - `--mapping_files_base_path` (env `GULP_DISSECT_MAPPING_FILES_BASE_PATH`)
 
 All other options are command-line only.  
+
+When `--context_name` and/or `--source_name` are provided, each value is treated as a context/source name override: gULP resolves it via `context_create` / `source_create` (creating it if missing), and the resulting ids are used in generated documents.
 
 ### set dissect plugin/s and provide mappings
 
@@ -197,8 +200,9 @@ Before ingestion starts, each extract tuple is validated:
 
 - `@timestamp` mapping is required (fallback to source field `ts` is applied only if no explicit `@timestamp` mapping exists and `ts` exists in mapping fields).
 - `event.code` mapping is required.
-- If `--context_id` is not provided, at least one mapping field must define `is_gulp_type: "context_name"`.
-- If `--source_id` is not provided, at least one mapping field must define `is_gulp_type: "source_name"`.
+- If `--context_name` is not provided, at least one mapping field must define `is_gulp_type: "context_name"`.
+- If `--source_name` is not provided, at least one mapping field must define `is_gulp_type: "source_name"`.
+- If `--context_name` and/or `--source_name` are provided, those overrides bypass mapping-based context/source extraction and are resolved/created using the provided values as names.
 
 ## Notes
 

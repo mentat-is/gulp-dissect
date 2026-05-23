@@ -18,7 +18,7 @@ from gulp_dissect.cli import (
 )
 
 
-def _cfg(context_id=None, source_id=None):
+def _cfg(context_name=None, source_name=None):
     return AppConfig(
         image_path="/tmp/image.img",
         username="u",
@@ -27,8 +27,8 @@ def _cfg(context_id=None, source_id=None):
         operation_id="test_operation",
         limit=0,
         chunk_size=1000,
-        context_id=context_id,
-        source_id=source_id,
+        context_name=context_name,
+        source_name=source_name,
         mapping_files_base_path=None,
         flt=None,
         reset_operation=False,
@@ -80,7 +80,7 @@ def test_collect_extract_specs_rejects_unpaired_plugin_mapping_parameters():
         collect_extract_specs(args)
 
 
-def test_collect_extract_specs_from_extract_file(tmp_path: Path):
+def test_collect_extract_specs_from_extract_rules(tmp_path: Path):
     payload = [
         {
             "plugin": "evt",
@@ -99,10 +99,10 @@ def test_collect_extract_specs_from_extract_file(tmp_path: Path):
             },
         }
     ]
-    extract_file = tmp_path / "extracts.json"
-    extract_file.write_text(json.dumps(payload), encoding="utf-8")
+    extract_rules_file = tmp_path / "extracts.json"
+    extract_rules_file.write_text(json.dumps(payload), encoding="utf-8")
 
-    args = parse_args(["--extract_file", str(extract_file)])
+    args = parse_args(["--extract_rules", str(extract_rules_file)])
     specs = collect_extract_specs(args)
     assert len(specs) == 1
     assert specs[0]["plugin"] == "evt"
@@ -485,7 +485,9 @@ def test_resolve_specs_accepts_context_source_overrides_and_injects_id_mapping()
         }
     ]
 
-    resolved = _resolve_specs(specs_raw, _cfg(context_id="ctx123", source_id="src456"))
+    resolved = _resolve_specs(
+        specs_raw, _cfg(context_name="ctx123", source_name="src456")
+    )
     assert resolved[0].mapping_id == "m1"
     assert resolved[0].plugin == "evt"
 
@@ -825,7 +827,7 @@ async def test_map_record_to_gulp_document_uses_explicit_ids_over_names():
             },
         }
     ]
-    cfg = _cfg(context_id="ctx-fixed", source_id="src-fixed")
+    cfg = _cfg(context_name="ctx-fixed", source_name="src-fixed")
     spec = (await _resolve_specs_async(specs_raw, cfg))[0]
 
     doc = await map_record_to_gulp_document(
@@ -841,8 +843,9 @@ async def test_map_record_to_gulp_document_uses_explicit_ids_over_names():
         {},
     )
 
-    assert doc["gulp.context_id"] == "ctx-fixed"
-    assert doc["gulp.source_id"] == "src-fixed"
+    assert doc["gulp.context_id"].startswith("ctx::test_operation::ctx-fixed")
+    assert doc["gulp.source_id"].startswith("src::test_operation::")
+    assert doc["gulp.source_id"].endswith("::src-fixed")
 
 
 @pytest.mark.asyncio
@@ -1157,7 +1160,7 @@ async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeyp
         }
     ]
 
-    cfg = _cfg(context_id="ctx-fixed", source_id="src-fixed")
+    cfg = _cfg(context_name="ctx-fixed", source_name="src-fixed")
     cfg.flt = GulpIngestionFilter(time_range=(1704067200000000000, 1704067200000000000))
     cfg.chunk_size = 10
     cfg.verbose = True

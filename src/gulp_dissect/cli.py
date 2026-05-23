@@ -78,8 +78,10 @@ class AppConfig:
         limit: Global maximum number of accepted documents to ingest; `0` means
             unlimited and is translated to `None` during runtime.
         chunk_size: Maximum documents sent per `/ingest_raw` request.
-        context_id: Optional explicit context id override.
-        source_id: Optional explicit source id override.
+        context_name: Optional explicit context name override resolved (or
+            created) on gULP and written as `gulp.context_id`.
+        source_name: Optional explicit source name override resolved (or
+            created) on gULP and written as `gulp.source_id`.
         mapping_files_base_path: Optional base path used to resolve relative
             mapping file paths in mapping parameters.
         flt: Optional client-side ingestion filter (`GulpIngestionFilter`).
@@ -94,8 +96,8 @@ class AppConfig:
     operation_id: str
     limit: int
     chunk_size: int
-    context_id: str | None
-    source_id: str | None
+    context_name: str | None
+    source_name: str | None
     mapping_files_base_path: str | None
     flt: GulpIngestionFilter | None
     reset_operation: bool
@@ -221,16 +223,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="number of mapped records sent per ingest_raw chunk",
     )
     p.add_argument(
-        "--context_id",
+        "--context_name",
         help=(
-            "explicit existing context id; if omitted, mapping must provide "
+            "explicit context name override; if omitted, mapping must provide "
             "an is_gulp_type=context_name field"
         ),
     )
     p.add_argument(
-        "--source_id",
+        "--source_name",
         help=(
-            "explicit existing source id; if omitted, mapping must provide "
+            "explicit source name override; if omitted, mapping must provide "
             "an is_gulp_type=source_name field"
         ),
     )
@@ -287,6 +289,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p.add_argument(
         "--extract_rules",
+        dest="extract_rules",
         action="append",
         default=[],
         help=(
@@ -321,8 +324,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     operation_id = args.operation_id
     limit_raw = args.limit if args.limit is not None else 0
     chunk_size_raw = args.chunk_size if args.chunk_size is not None else 1000
-    context_id = args.context_id
-    source_id = args.source_id
+    context_name = args.context_name
+    source_name = args.source_name
     mapping_files_base_path = _env_or_arg(
         args.mapping_files_base_path,
         "GULP_DISSECT_MAPPING_FILES_BASE_PATH",
@@ -368,8 +371,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         operation_id=str(operation_id),
         limit=limit,
         chunk_size=chunk_size,
-        context_id=str(context_id) if context_id else None,
-        source_id=str(source_id) if source_id else None,
+        context_name=str(context_name) if context_name else None,
+        source_name=str(source_name) if source_name else None,
         mapping_files_base_path=(
             str(mapping_files_base_path) if mapping_files_base_path else None
         ),
@@ -444,8 +447,8 @@ def _ecs_contains(field_mapping: dict[str, Any], ecs_name: str) -> bool:
 def _normalize_mapping(
     mapping_id: str,
     mapping: dict[str, Any],
-    context_id: str | None,
-    source_id: str | None,
+    context_name: str | None,
+    source_name: str | None,
     event_code_override: Any = None,
 ) -> ResolvedExtractSpec:
     """Validate mapping requirements and derive routing-related metadata.
@@ -463,8 +466,8 @@ def _normalize_mapping(
     Args:
         mapping_id: Mapping identifier selected from resolved mappings.
         mapping: Mapping dictionary as produced by gULP model dump.
-        context_id: Optional explicit context override from CLI.
-        source_id: Optional explicit source override from CLI.
+        context_name: Optional explicit context name override from CLI.
+        source_name: Optional explicit source name override from CLI.
         event_code_override: Optional top-level mapping_parameters override.
 
     Returns:
@@ -530,13 +533,13 @@ def _normalize_mapping(
     ):
         raise ValueError(f"mapping '{mapping_id}' is missing event.code mapping")
 
-    if context_id is None and not context_name_fields:
+    if context_name is None and not context_name_fields:
         raise ValueError(
-            f"mapping '{mapping_id}' must define a field with is_gulp_type='context_name' when --context_id is not provided"
+            f"mapping '{mapping_id}' must define a field with is_gulp_type='context_name' when --context_name is not provided"
         )
-    if source_id is None and not source_name_fields:
+    if source_name is None and not source_name_fields:
         raise ValueError(
-            f"mapping '{mapping_id}' must define a field with is_gulp_type='source_name' when --source_id is not provided"
+            f"mapping '{mapping_id}' must define a field with is_gulp_type='source_name' when --source_name is not provided"
         )
 
     return ResolvedExtractSpec(
@@ -596,8 +599,8 @@ async def resolve_specs(
         normalized = _normalize_mapping(
             mapping_id,
             mapping,
-            cfg.context_id,
-            cfg.source_id,
+            cfg.context_name,
+            cfg.source_name,
             event_code_override=mp_dict.get("event_code"),
         )
         normalized.plugin = str(plugin)
@@ -771,10 +774,19 @@ async def map_record_to_gulp_document(
         }
     )
 
-    context_id = cfg.context_id
-    source_id = cfg.source_id
-    context_name = spec.mapping.get("default_context") if context_id is None else None
-    source_name = spec.mapping.get("default_source") if source_id is None else None
+    explicit_context_name = cfg.context_name
+    explicit_source_name = cfg.source_name
+    context_locked = explicit_context_name is not None
+    source_locked = explicit_source_name is not None
+
+    context_id: str | None = None
+    source_id: str | None = None
+    context_name = (
+        explicit_context_name if context_locked else spec.mapping.get("default_context")
+    )
+    source_name = (
+        explicit_source_name if source_locked else spec.mapping.get("default_source")
+    )
     value_aliases = spec.mapping.get("value_aliases") or {}
 
     for source_field, field_mapping in fields.items():
@@ -799,13 +811,13 @@ async def map_record_to_gulp_document(
         if mapping_attr(field_mapping, "flatten_json"):
             mapped.update(flatten_json_value(transformed))
 
-        if gulp_type == "context_id" and context_id is None:
+        if gulp_type == "context_id" and not context_locked and context_id is None:
             context_id = str(transformed)
-        elif gulp_type == "context_name" and context_id is None:
+        elif gulp_type == "context_name" and not context_locked and context_id is None:
             context_name = str(transformed)
-        elif gulp_type == "source_id" and source_id is None:
+        elif gulp_type == "source_id" and not source_locked and source_id is None:
             source_id = str(transformed)
-        elif gulp_type == "source_name" and source_id is None:
+        elif gulp_type == "source_name" and not source_locked and source_id is None:
             source_name = str(transformed)
 
         ecs_targets = field_mapping.get("ecs")
