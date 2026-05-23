@@ -34,7 +34,7 @@ cd gulp-dissect
 -._:'                     .;'                           '      '                               
 
 2026-05-23 17:28:24,623|gulp-dissect||DEBUG|28599,28599|_reconfigure|"muty/log.py", line 245|logger "<TraceLogger gulp-dissect (DEBUG)>" configured!
-usage: gulp-dissect [-h] [--image_path IMAGE_PATH] [--username USERNAME] [--password PASSWORD] [--gulp_url GULP_URL]
+usage: gulp-dissect [-h] [--version] [--image_path IMAGE_PATH] [--username USERNAME] [--password PASSWORD] [--gulp_url GULP_URL]
                     [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk_size CHUNK_SIZE] [--context_name CONTEXT_NAME]
                     [--source_name SOURCE_NAME] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT]
                     [--reset-operation] [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS]
@@ -44,6 +44,7 @@ Extract data from a forensic image with Dissect and ingest mapped records into g
 
 options:
   -h, --help            show this help message and exit
+  --version             show program's version number and exit
   --image_path IMAGE_PATH
                         absolute path to the forensic disk image to process (default: None)
   --username USERNAME   gULP username (or set GULP_DISSECT_USERNAME) (default: None)
@@ -92,8 +93,7 @@ When `--context_name` and/or `--source_name` are provided, each value is treated
 
 the only difference is not all flags are supported. specifically:
 
-1. `is_gulp_type` is supported only for `context_name` and `source_name` to allow auto-assigning `gulp.context_id` and `gulp.source_id` respectively when the corresponding CLI flags are not provided.
-2. `extra_doc_with_event_code` is currently not supported (and possibly never will be)
+> 1. `is_gulp_type` is supported only for `context_name` and `source_name` to allow auto-assigning `gulp.context_id` and `gulp.source_id` respectively when the corresponding CLI flags are not provided.
 
 `--plugin` and `--mapping_parameters` must be provided using one of these forms:
 

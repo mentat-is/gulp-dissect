@@ -4,14 +4,18 @@ from pathlib import Path
 
 import pytest
 from gulp.api.opensearch.filters import GulpIngestionFilter
+from gulp.api.mapping.mapping_utils import build_gulp_document_id
 
 from gulp_dissect.cli import (
     _passes_ingestion_filter,
     AppConfig,
     build_config,
     collect_extract_specs,
+    get_app_version,
     ingest_spec,
     map_record_to_gulp_document,
+    map_record_to_gulp_documents,
+    print_banner,
     normalize_timestamp,
     parse_args,
     resolve_specs,
@@ -78,6 +82,29 @@ def test_collect_extract_specs_rejects_unpaired_plugin_mapping_parameters():
 
     with pytest.raises(ValueError, match="same number"):
         collect_extract_specs(args)
+
+
+def test_parse_args_version_prints_version_and_exits(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--version"])
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == get_app_version()
+
+
+def test_print_banner_includes_version(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    monkeypatch.setattr("gulp_dissect.cli.art.text2art", lambda text, font: "BANNER")
+
+    print_banner()
+
+    output = capsys.readouterr().out
+    assert "BANNER" in output
+    assert f"gulp-dissect v{get_app_version()}" in output
 
 
 def test_collect_extract_specs_from_extract_rules(tmp_path: Path):
@@ -757,6 +784,12 @@ class _FakeIngestClient:
         self.ingest = _FakeIngestApi()
 
 
+class _FakeFullClient(_FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.ingest = _FakeIngestApi()
+
+
 @pytest.mark.asyncio
 async def test_map_record_to_gulp_document_builds_raw_doc_from_mapping():
     specs_raw = [
@@ -1140,6 +1173,68 @@ async def test_map_record_to_gulp_document_overrides_event_code_from_mapping_par
 
 
 @pytest.mark.asyncio
+async def test_map_record_to_gulp_documents_supports_extra_doc_with_event_code():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "event_code": "base-event",
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "ExtraTs": {"extra_doc_with_event_code": "extra-event"},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                            "Computername": {"ecs": ["host.name"]},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    docs = await map_record_to_gulp_documents(
+        _FakeClient(),
+        _cfg(),
+        spec,
+        {
+            "ts": "2024-01-01T00:00:00Z",
+            "ExtraTs": "2024-01-02T00:00:00Z",
+            "hostname": "host-a",
+            "SourceName": "security",
+            "Computername": "host-a",
+        },
+        1,
+        {},
+        {},
+    )
+
+    assert len(docs) == 2
+    expected_base_id = build_gulp_document_id(
+        event_original=docs[0]["event.original"],
+        event_code=docs[0]["event.code"],
+        operation_id="test_operation",
+        context_id=docs[0]["gulp.context_id"],
+        source_id=docs[0]["gulp.source_id"],
+        event_sequence=docs[0]["event.sequence"],
+        timestamp=docs[0]["@timestamp"],
+    )
+    assert docs[0]["_id"] == expected_base_id
+    assert docs[0]["event.code"] == "base-event"
+    assert docs[0]["@timestamp"] == "2024-01-01T00:00:00.000Z"
+    assert docs[1]["event.code"] == "extra-event"
+    assert docs[1]["@timestamp"] == "2024-01-02T00:00:00.000Z"
+    assert docs[1]["host.name"] == "host-a"
+    assert docs[1]["gulp.context_id"] == docs[0]["gulp.context_id"]
+    assert docs[1]["gulp.source_id"] == docs[0]["gulp.source_id"]
+    assert docs[1]["gulp.base_document_id"] == docs[0]["_id"]
+
+
+@pytest.mark.asyncio
 async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeypatch):
     from gulp_dissect import cli as cli_module
 
@@ -1174,7 +1269,7 @@ async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeyp
 
     seq = {"value": 0}
 
-    async def _fake_map_record_to_gulp_document(
+    async def _fake_map_record_to_gulp_documents(
         client,
         cfg,
         spec,
@@ -1188,17 +1283,19 @@ async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeyp
             ts = "2024-01-01T00:00:00Z"
         else:
             ts = "2024-01-02T00:00:00Z"
-        return {
-            "@timestamp": ts,
-            "event.code": "4624",
-            "gulp.context_id": "ctx-fixed",
-            "gulp.source_id": "src-fixed",
-        }
+        return [
+            {
+                "@timestamp": ts,
+                "event.code": "4624",
+                "gulp.context_id": "ctx-fixed",
+                "gulp.source_id": "src-fixed",
+            }
+        ]
 
     monkeypatch.setattr(
         cli_module,
-        "map_record_to_gulp_document",
-        _fake_map_record_to_gulp_document,
+        "map_record_to_gulp_documents",
+        _fake_map_record_to_gulp_documents,
     )
 
     client = _FakeIngestClient()
@@ -1209,3 +1306,58 @@ async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeyp
     assert len(client.ingest.calls[0]["data"]) == 1
     assert "flt" not in client.ingest.calls[0]["params"]
     assert "plugin_params" in client.ingest.calls[0]["params"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_spec_expands_extra_doc_with_event_code(monkeypatch):
+    from gulp_dissect import cli as cli_module
+
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "event_code": "base-event",
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "ExtraTs": {"extra_doc_with_event_code": "extra-event"},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                            "Computername": {"ecs": ["host.name"]},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    monkeypatch.setattr(
+        cli_module,
+        "iter_plugin_records",
+        lambda target, plugin: iter(
+            [
+                {
+                    "ts": "2024-01-01T00:00:00Z",
+                    "ExtraTs": "2024-01-02T00:00:00Z",
+                    "hostname": "host-a",
+                    "SourceName": "security",
+                    "Computername": "host-a",
+                }
+            ]
+        ),
+    )
+
+    client = _FakeFullClient()
+    ingested = await ingest_spec(
+        client, _cfg(), target=None, spec=spec, max_records=None
+    )
+
+    assert ingested == 2
+    assert len(client.ingest.calls) == 1
+    assert len(client.ingest.calls[0]["data"]) == 2
+    assert client.ingest.calls[0]["data"][0]["event.code"] == "base-event"
+    assert client.ingest.calls[0]["data"][1]["event.code"] == "extra-event"

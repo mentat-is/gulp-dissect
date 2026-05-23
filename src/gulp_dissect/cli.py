@@ -44,7 +44,10 @@ from muty.log import MutyLogger
 import muty.time
 from gulp.api.mapping.mapping_utils import (
     apply_value_aliases,
+    build_extra_doc_fields,
+    build_gulp_document_id,
     convert_special_timestamp,
+    expand_extra_docs,
     flatten_json_value,
     mapping_attr,
     mapping_parameters_to_mapping,
@@ -55,6 +58,7 @@ from gulp.api.opensearch.filters import GulpIngestionFilter
 from gulp_sdk import GulpClient
 from tqdm import tqdm
 
+from gulp_dissect import __version__
 from gulp.structs import GulpMappingParameters
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,20 @@ class ResolvedExtractSpec:
 # ---------------------------------------------------------------------------
 
 
+def get_app_version() -> str:
+    """Return the gulp-dissect package version."""
+
+    return __version__
+
+
+def print_banner() -> None:
+    """Print the startup banner together with the current version."""
+
+    banner = art.text2art("gulp-dissect", font="random")
+    print(banner)
+    print(f"gulp-dissect v{get_app_version()}")
+
+
 def _read_json_arg(raw: str) -> Any:
     """Parse JSON input from a string or reference file.
 
@@ -186,6 +204,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "records into gULP via ingest_raw."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=get_app_version(),
     )
     p.add_argument(
         "--image_path",
@@ -700,7 +723,7 @@ async def _ensure_source_id(
     return source_id
 
 
-async def map_record_to_gulp_document(
+async def map_record_to_gulp_documents(
     client: GulpClient,
     cfg: AppConfig,
     spec: ResolvedExtractSpec,
@@ -708,8 +731,8 @@ async def map_record_to_gulp_document(
     event_sequence: int,
     context_cache: dict[str, str],
     source_cache: dict[tuple[str, str], str],
-) -> dict[str, Any]:
-    """Map one Dissect record into a gULP raw document payload.
+) -> list[dict[str, Any]]:
+    """Map one Dissect record into one or more gULP raw document payloads.
 
     This performs all per-record transformations required for ingest compatibility:
 
@@ -732,7 +755,7 @@ async def map_record_to_gulp_document(
         source_cache: In-memory cache for source id lookups.
 
     Returns:
-        JSON-serializable mapped document dictionary.
+        JSON-serializable mapped document dictionaries.
 
     Raises:
         ValueError: If required mapped values cannot be resolved.
@@ -788,6 +811,7 @@ async def map_record_to_gulp_document(
         explicit_source_name if source_locked else spec.mapping.get("default_source")
     )
     value_aliases = spec.mapping.get("value_aliases") or {}
+    extra_docs: list[dict[str, Any]] = []
 
     for source_field, field_mapping in fields.items():
         if (
@@ -811,6 +835,15 @@ async def map_record_to_gulp_document(
         if mapping_attr(field_mapping, "flatten_json"):
             mapped.update(flatten_json_value(transformed))
 
+        extra_doc_timestamp: str | None = None
+        if mapping_attr(field_mapping, "extra_doc_with_event_code"):
+            extra_doc_timestamp = convert_special_timestamp(
+                raw_value,
+                timestamp_kind=mapping_attr(field_mapping, "is_timestamp") or "generic",
+                timestamp_format=mapping_attr(field_mapping, "timestamp_format"),
+                output="iso8601",
+            )
+
         if gulp_type == "context_id" and not context_locked and context_id is None:
             context_id = str(transformed)
         elif gulp_type == "context_name" and not context_locked and context_id is None:
@@ -823,7 +856,17 @@ async def map_record_to_gulp_document(
         ecs_targets = field_mapping.get("ecs")
         if isinstance(ecs_targets, str):
             ecs_targets = [ecs_targets]
+        mapped_fields_for_extra: list[str] = []
         if not ecs_targets:
+            if extra_doc_timestamp is not None:
+                extra_docs.append(
+                    build_extra_doc_fields(
+                        field_mapping,
+                        timestamp_value=extra_doc_timestamp,
+                        event_code_field="event.code",
+                        timestamp_field="@timestamp",
+                    )
+                )
             continue
 
         for ecs_field in ecs_targets:
@@ -842,6 +885,18 @@ async def map_record_to_gulp_document(
                 alias_target = {ecs_field: mapped[ecs_field]}
                 apply_value_aliases(ecs_field, alias_target, value_aliases)
                 mapped[ecs_field] = alias_target[ecs_field]
+            mapped_fields_for_extra.append(ecs_field)
+
+        if extra_doc_timestamp is not None:
+            extra_docs.append(
+                build_extra_doc_fields(
+                    field_mapping,
+                    timestamp_value=extra_doc_timestamp,
+                    mapped_fields=mapped_fields_for_extra,
+                    event_code_field="event.code",
+                    timestamp_field="@timestamp",
+                )
+            )
 
     if "@timestamp" not in mapped:
         raise ValueError(f"record missing mapped @timestamp for plugin '{spec.plugin}'")
@@ -876,7 +931,41 @@ async def map_record_to_gulp_document(
     mapped["gulp.context_id"] = context_id
     mapped["gulp.source_id"] = source_id
 
-    return mapped
+    base_document_id = build_gulp_document_id(
+        event_original=str(mapped["event.original"]),
+        event_code=str(mapped["event.code"]),
+        operation_id=cfg.operation_id,
+        context_id=str(mapped["gulp.context_id"]),
+        source_id=str(mapped["gulp.source_id"]),
+        event_sequence=int(mapped.get("event.sequence", 0)),
+        timestamp=str(mapped["@timestamp"]),
+    )
+    mapped["_id"] = base_document_id
+
+    return expand_extra_docs(mapped, extra_docs, base_document_id=base_document_id)
+
+
+async def map_record_to_gulp_document(
+    client: GulpClient,
+    cfg: AppConfig,
+    spec: ResolvedExtractSpec,
+    raw_record: dict[str, Any],
+    event_sequence: int,
+    context_cache: dict[str, str],
+    source_cache: dict[tuple[str, str], str],
+) -> dict[str, Any]:
+    """Compatibility wrapper returning the primary mapped document only."""
+
+    documents = await map_record_to_gulp_documents(
+        client,
+        cfg,
+        spec,
+        raw_record,
+        event_sequence,
+        context_cache,
+        source_cache,
+    )
+    return documents[0]
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -1132,7 +1221,7 @@ async def ingest_spec(
                 break
 
             total += 1
-            mapped_record = await map_record_to_gulp_document(
+            mapped_records = await map_record_to_gulp_documents(
                 client,
                 cfg,
                 spec,
@@ -1142,17 +1231,24 @@ async def ingest_spec(
                 source_cache,
             )
 
-            if not _passes_ingestion_filter(mapped_record, cfg.flt):
-                continue
+            for mapped_record in mapped_records:
+                if max_records is not None and accepted_total >= max_records:
+                    break
 
-            accepted_total += 1
-            if cfg.verbose:
-                print(json.dumps(mapped_record, sort_keys=True, default=str))
-            elif progress is not None:
-                progress.update(1)
-            chunk.append(mapped_record)
-            if len(chunk) >= cfg.chunk_size:
-                await _flush(last=False)
+                if not _passes_ingestion_filter(mapped_record, cfg.flt):
+                    continue
+
+                accepted_total += 1
+                if cfg.verbose:
+                    print(json.dumps(mapped_record, sort_keys=True, default=str))
+                elif progress is not None:
+                    progress.update(1)
+                chunk.append(mapped_record)
+                if len(chunk) >= cfg.chunk_size:
+                    await _flush(last=False)
+
+            if max_records is not None and accepted_total >= max_records:
+                break
 
         if chunk:
             await _flush(last=True)
@@ -1235,11 +1331,10 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Process-style exit code (`0` for success, `1` for failure).
     """
-    banner = art.text2art("gulp-dissect", font="random")
-    print(banner)
-    MutyLogger.get_instance(name="gulp-dissect")
     try:
         args = parse_args(argv)
+        print_banner()
+        MutyLogger.get_instance(name="gulp-dissect")
         cfg = build_config(args)
         specs_raw = collect_extract_specs(args)
         specs = asyncio.run(resolve_specs(specs_raw, cfg))
