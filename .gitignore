@@ -1,0 +1,27 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+pyrightconfig.json
+venv
+
+# VSCode
+.vscode/
+
+#auto generated docs
+docs/html
+.VSCodeCounter
+
+# misc
+.github/agents
+*.egg-info
+build
+.DS_Store
+.specstory
+.coverage
+site
+_version.py
+dist
+
