@@ -1,3 +1,27 @@
+"""Command-line entry point for extracting with Dissect and ingesting into gULP.
+
+This module implements the full `gulp-dissect` runtime pipeline:
+
+1. Parse CLI arguments and construct a validated runtime configuration.
+2. Resolve one or more extract tuple specifications (`plugin`, `mapping_parameters`)
+     using gULP's own mapping-resolution utilities.
+3. Open a Dissect target image and stream records for each requested plugin.
+4. Transform each Dissect record into a gULP-compatible raw document by applying
+     mapping rules, timestamp normalization, type coercion, ECS projection, and
+     context/source resolution.
+5. Optionally filter mapped documents client-side via `GulpIngestionFilter`.
+6. Send accepted documents to `/ingest_raw` in bounded chunks.
+
+Design notes:
+
+- Mapping parsing intentionally delegates to `mapping_parameters_to_mapping` so
+    behavior stays aligned with the gULP backend.
+- Client-side filtering is performed before ingestion API calls and is not
+    forwarded inside `plugin_params`.
+- The CLI supports multiple extract tuples and enforces a global ingestion limit
+    (`--limit`) across all tuples in sequence.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,21 +30,61 @@ import json
 import os
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from dateutil import parser as dateparser
+import art
 from dissect.target.plugin import FunctionDescriptor, find_functions
 from dissect.target.target import Target
 from dissect.target.tools.utils.cli import execute_function_on_target
+from muty.log import MutyLogger
+import muty.time
+from gulp.api.mapping.mapping_utils import (
+    apply_value_aliases,
+    convert_special_timestamp,
+    flatten_json_value,
+    mapping_attr,
+    mapping_parameters_to_mapping,
+    normalize_timestamp,
+    transform_scalar,
+)
+from gulp.api.opensearch.filters import GulpIngestionFilter
 from gulp_sdk import GulpClient
 from tqdm import tqdm
+
+from gulp.structs import GulpMappingParameters
+
+# ---------------------------------------------------------------------------
+# Data classes for configuration and resolved extract specifications.
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class AppConfig:
+    """Runtime configuration for a `gulp-dissect` execution.
+
+    The values in this dataclass are fully normalized and validated by
+    :func:`build_config` before any extraction starts.
+
+    Attributes:
+        image_path: Absolute or container-local path to the forensic image.
+        username: gULP login username.
+        password: gULP login password.
+        gulp_url: Base URL of the gULP server.
+        operation_id: Target operation identifier where documents are ingested.
+        limit: Global maximum number of accepted documents to ingest; `0` means
+            unlimited and is translated to `None` during runtime.
+        chunk_size: Maximum documents sent per `/ingest_raw` request.
+        context_id: Optional explicit context id override.
+        source_id: Optional explicit source id override.
+        flt: Optional client-side ingestion filter (`GulpIngestionFilter`).
+        reset_operation: Whether to delete/recreate the operation before ingest.
+        verbose: Whether to print mapped documents instead of showing progress.
+    """
+
     image_path: str
     username: str
     password: str
@@ -30,12 +94,20 @@ class AppConfig:
     chunk_size: int
     context_id: str | None
     source_id: str | None
+    flt: GulpIngestionFilter | None
     reset_operation: bool
     verbose: bool
 
 
 @dataclass
 class ResolvedExtractSpec:
+    """Validated extract tuple used by the extraction/ingestion loop.
+
+    A `ResolvedExtractSpec` is produced from user-provided tuple inputs after
+    mapping resolution and static validation. Precomputed field lists are stored
+    for downstream logic and diagnostics.
+    """
+
     plugin: str
     mapping_id: str
     mapping: dict[str, Any]
@@ -44,9 +116,31 @@ class ResolvedExtractSpec:
     event_code_fields: list[str]
     context_name_fields: list[str]
     source_name_fields: list[str]
+    mapping_parameters: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing and configuration helpers.
+# ---------------------------------------------------------------------------
 
 
 def _read_json_arg(raw: str) -> Any:
+    """Parse JSON input from a string or reference file.
+
+    If the argument starts with `@`, the remainder is treated as a file path and
+    file contents are parsed as JSON. Otherwise, the argument itself is parsed as
+    an inline JSON string.
+
+    Args:
+        raw: Raw CLI value.
+
+    Returns:
+        Parsed JSON value.
+
+    Raises:
+        FileNotFoundError: If `@path` points to a missing file.
+        json.JSONDecodeError: If content is not valid JSON.
+    """
     text = raw
     if raw.startswith("@"):
         text = Path(raw[1:]).read_text(encoding="utf-8")
@@ -54,6 +148,16 @@ def _read_json_arg(raw: str) -> Any:
 
 
 def _env_or_arg(value: str | int | None, env_name: str, default: Any = None) -> Any:
+    """Resolve a setting by precedence: CLI arg -> env var -> default.
+
+    Args:
+        value: Parsed CLI argument value.
+        env_name: Environment variable name used as fallback.
+        default: Default value used when both arg and env are unset.
+
+    Returns:
+        The resolved value from highest-precedence source.
+    """
     if value is not None:
         return value
     env_val = os.getenv(env_name)
@@ -63,6 +167,14 @@ def _env_or_arg(value: str | int | None, env_name: str, default: Any = None) -> 
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Define and parse CLI arguments for the `gulp-dissect` command.
+
+    Args:
+        argv: Optional argument vector for tests or programmatic invocation.
+
+    Returns:
+        Parsed argparse namespace.
+    """
     p = argparse.ArgumentParser(
         description=(
             "Extract data from a forensic image with Dissect and ingest mapped "
@@ -120,6 +232,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--flt",
+        help=(
+            "optional GulpIngestionFilter JSON object applied "
+            "client-side before ingest_raw calls"
+        ),
+    )
+    p.add_argument(
         "--reset-operation",
         action="store_true",
         help=(
@@ -169,6 +288,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
+    """Build and validate normalized runtime configuration.
+
+    This function centralizes configuration validation, including required
+    argument checks, numeric bound checks, and `--flt` schema validation through
+    `GulpIngestionFilter`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Fully validated :class:`AppConfig`.
+
+    Raises:
+        ValueError: For missing required parameters, invalid ranges, or malformed
+            filter configuration.
+    """
     image_path = args.image_path
     username = _env_or_arg(args.username, "GULP_DISSECT_USERNAME")
     password = _env_or_arg(args.password, "GULP_DISSECT_PASSWORD")
@@ -178,8 +313,20 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     chunk_size_raw = args.chunk_size if args.chunk_size is not None else 1000
     context_id = args.context_id
     source_id = args.source_id
+    flt_raw = args.flt
     reset_operation_raw = args.reset_operation
 
+    flt: GulpIngestionFilter | None = None
+    if flt_raw is not None:
+        parsed_flt = _read_json_arg(flt_raw)
+        if not isinstance(parsed_flt, dict):
+            raise ValueError("flt must be a JSON object")
+        try:
+            flt = GulpIngestionFilter.model_validate(parsed_flt)
+        except Exception as exc:
+            raise ValueError(f"invalid flt: {exc}") from exc
+
+    # Required runtime settings must be present either as CLI args or env vars.
     required = {
         "image_path": image_path,
         "username": username,
@@ -209,17 +356,36 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         chunk_size=chunk_size,
         context_id=str(context_id) if context_id else None,
         source_id=str(source_id) if source_id else None,
+        flt=flt,
         reset_operation=str(reset_operation_raw).lower() in {"1", "true", "yes", "on"},
         verbose=bool(args.verbose),
     )
 
 
 def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
-    """Collect extract tuples from repeated CLI pairs and/or JSON files."""
+    """Collect extract tuple payloads from CLI pair flags and/or JSON files.
+
+    Supported forms:
+
+    - repeated `--plugin` + `--mapping_parameters` pairs (1:1)
+    - one or more `--extract_file` JSON files containing one tuple object or a
+      list of tuple objects.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        List of raw tuple dictionaries with keys `plugin` and
+        `mapping_parameters`.
+
+    Raises:
+        ValueError: If pair flags are unbalanced or no specs are provided.
+    """
 
     specs: list[dict[str, Any]] = []
 
     if args.plugin or args.mapping_parameters:
+        # The plugin and mapping_parameters flags must be paired 1:1.
         if len(args.plugin) != len(args.mapping_parameters):
             raise ValueError(
                 "--plugin and --mapping_parameters must be provided the same number of times"
@@ -232,7 +398,7 @@ def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
             )
 
     for extract_file in args.extract_file:
-        # Accept either one tuple object or a list of tuple objects in one file.
+        # Accept either a single tuple object or a list of tuple objects.
         loaded = json.loads(Path(extract_file).read_text(encoding="utf-8"))
         if isinstance(loaded, list):
             specs.extend(loaded)
@@ -245,39 +411,11 @@ def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
     return specs
 
 
-def _select_mapping(mapping_parameters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    has_file = bool(mapping_parameters.get("mapping_file"))
-    has_mappings = bool(mapping_parameters.get("mappings"))
-    if has_file == has_mappings:
-        raise ValueError(
-            "mapping_parameters must define exactly one of mapping_file or mappings"
-        )
-
-    mappings: dict[str, Any]
-    if has_file:
-        mapping_file = Path(str(mapping_parameters["mapping_file"]))
-        if not mapping_file.exists():
-            raise ValueError(f"mapping_file not found: {mapping_file}")
-        loaded = json.loads(mapping_file.read_text(encoding="utf-8"))
-        mappings = loaded.get("mappings", loaded)
-    else:
-        mappings = mapping_parameters["mappings"]
-
-    if not isinstance(mappings, dict) or not mappings:
-        raise ValueError("resolved mappings must be a non-empty object")
-
-    mapping_id = mapping_parameters.get("mapping_id") or next(iter(mappings.keys()))
-    if mapping_id not in mappings:
-        raise ValueError(f"mapping_id '{mapping_id}' not found in mappings")
-
-    mapping = mappings[mapping_id]
-    if not isinstance(mapping, dict):
-        raise ValueError("selected mapping must be an object")
-
-    return str(mapping_id), deepcopy(mapping)
-
-
 def _ecs_contains(field_mapping: dict[str, Any], ecs_name: str) -> bool:
+    """Return whether a mapping field routes to the requested ECS destination.
+
+    The `ecs` attribute can be either a single string or a list of strings.
+    """
     ecs = field_mapping.get("ecs")
     if isinstance(ecs, str):
         return ecs == ecs_name
@@ -292,7 +430,29 @@ def _normalize_mapping(
     context_id: str | None,
     source_id: str | None,
 ) -> ResolvedExtractSpec:
-    """Validate one mapping block and precompute the fields needed during transformation."""
+    """Validate mapping requirements and derive routing-related metadata.
+
+    Validation rules enforced here are runtime-critical and intentionally strict:
+
+    - mapping must define a non-empty `fields` object
+    - a mapping to `@timestamp` must exist (with fallback injection to `ts`)
+    - a mapping to `event.code` must exist
+    - when CLI overrides are absent, mapping must provide
+      `is_gulp_type=context_name` and `is_gulp_type=source_name`
+
+    Args:
+        mapping_id: Mapping identifier selected from resolved mappings.
+        mapping: Mapping dictionary as produced by gULP model dump.
+        context_id: Optional explicit context override from CLI.
+        source_id: Optional explicit source override from CLI.
+
+    Returns:
+        Normalized specification with precomputed field metadata.
+
+    Raises:
+        ValueError: If mapping structure or required semantic contracts are
+            invalid.
+    """
 
     fields = mapping.get("fields")
     if not isinstance(fields, dict) or not fields:
@@ -320,25 +480,27 @@ def _normalize_mapping(
         if field_type == "source_name":
             source_name_fields.append(source_field)
 
-    # Compatibility default: map @timestamp to ts if not explicitly set and ts exists.
-    if not timestamp_fields and "ts" in fields:
-        ts_mapping = fields.get("ts")
-        if isinstance(ts_mapping, dict):
-            ecs = ts_mapping.get("ecs")
-            if ecs is None:
-                ts_mapping["ecs"] = ["@timestamp"]
-            elif isinstance(ecs, str):
-                if ecs != "@timestamp":
-                    ts_mapping["ecs"] = [ecs, "@timestamp"]
-            elif isinstance(ecs, list) and "@timestamp" not in ecs:
-                ecs.append("@timestamp")
-            timestamp_fields.append("ts")
-            timestamp_formats["ts"] = ts_mapping.get("timestamp_format")
+    if not timestamp_fields:
+        # default mapping of @timestamp to "ts" if no other timestamp mapping is provided
+        ts_mapping = fields.setdefault("ts", {})
+        if not isinstance(ts_mapping, dict):
+            ts_mapping = {}
+            fields["ts"] = ts_mapping
+
+        ecs = ts_mapping.get("ecs")
+        if ecs is None:
+            ts_mapping["ecs"] = ["@timestamp"]
+        elif isinstance(ecs, str):
+            if ecs != "@timestamp":
+                ts_mapping["ecs"] = [ecs, "@timestamp"]
+        elif isinstance(ecs, list) and "@timestamp" not in ecs:
+            ecs.append("@timestamp")
+
+        timestamp_fields.append("ts")
+        timestamp_formats["ts"] = ts_mapping.get("timestamp_format")
 
     if not timestamp_fields:
-        raise ValueError(
-            f"mapping '{mapping_id}' is missing @timestamp mapping (and no fallback field 'ts' is available)"
-        )
+        raise ValueError(f"mapping '{mapping_id}' is missing @timestamp mapping")
     if not event_code_fields:
         raise ValueError(f"mapping '{mapping_id}' is missing event.code mapping")
 
@@ -363,9 +525,25 @@ def _normalize_mapping(
     )
 
 
-def resolve_specs(
+async def resolve_specs(
     specs_raw: list[dict[str, Any]], cfg: AppConfig
 ) -> list[ResolvedExtractSpec]:
+    """Resolve user tuple inputs into validated, normalized extract specs.
+
+    Mapping resolution is delegated to gULP's
+    `mapping_parameters_to_mapping` helper to guarantee parity with backend
+    behavior for inline mappings, mapping files, and additional mapping imports.
+
+    Args:
+        specs_raw: Raw tuple dictionaries collected from CLI/file inputs.
+        cfg: Runtime configuration, used for context/source validation rules.
+
+    Returns:
+        List of validated :class:`ResolvedExtractSpec` entries.
+
+    Raises:
+        ValueError: If tuple format, plugin, or mapping payloads are invalid.
+    """
     resolved: list[ResolvedExtractSpec] = []
     for idx, spec in enumerate(specs_raw, start=1):
         if not isinstance(spec, dict):
@@ -374,119 +552,32 @@ def resolve_specs(
         if not plugin:
             raise ValueError(f"extract spec #{idx} is missing plugin")
 
-        mapping_parameters = spec.get("mapping_parameters")
-        if not isinstance(mapping_parameters, dict):
+        mp_dict = spec.get("mapping_parameters")
+        if not isinstance(mp_dict, dict):
             raise ValueError(
                 f"extract spec #{idx} is missing mapping_parameters object"
             )
 
-        mapping_id, mapping = _select_mapping(mapping_parameters)
+        # Parse mappings using the same helper as gULP so inline mappings and
+        # mapping file inputs resolve with identical rules.
+        mapping_parameters = GulpMappingParameters.model_validate(mp_dict)
+        resolved_mappings, mapping_id = await mapping_parameters_to_mapping(
+            mapping_parameters
+        )
+        mapping = resolved_mappings[mapping_id].model_dump()
+
         normalized = _normalize_mapping(
             mapping_id, mapping, cfg.context_id, cfg.source_id
         )
         normalized.plugin = str(plugin)
+        normalized.mapping_parameters = deepcopy(mp_dict)
         resolved.append(normalized)
 
     return resolved
 
 
-def normalize_timestamp(value: Any, timestamp_format: str | None = None) -> str:
-    """Normalize supported timestamp inputs into the UTC ISO8601 format required by gULP."""
-
-    dt: datetime
-
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)):
-        # Heuristic for unix timestamps: seconds/ms/us/ns.
-        abs_v = abs(float(value))
-        if abs_v >= 1e18:
-            dt = datetime.fromtimestamp(float(value) / 1e9, tz=timezone.utc)
-        elif abs_v >= 1e15:
-            dt = datetime.fromtimestamp(float(value) / 1e6, tz=timezone.utc)
-        elif abs_v >= 1e12:
-            dt = datetime.fromtimestamp(float(value) / 1e3, tz=timezone.utc)
-        else:
-            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-    elif isinstance(value, str):
-        if timestamp_format:
-            dt = datetime.strptime(value, timestamp_format)
-        else:
-            dt = dateparser.parse(value)
-    else:
-        raise ValueError(f"Unsupported timestamp value type: {type(value)!r}")
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-
-    # Keep millisecond precision and force UTC Z suffix.
-    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _flatten_json_value(value: Any) -> dict[str, Any]:
-    """Flatten a JSON object so nested keys can be emitted as dotted document fields."""
-
-    if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, dict):
-        raise ValueError("flatten_json requires a JSON object value")
-
-    flattened: dict[str, Any] = {}
-
-    def _walk(prefix: str, current: Any) -> None:
-        if isinstance(current, dict):
-            for key, child in current.items():
-                next_prefix = f"{prefix}.{key}" if prefix else str(key)
-                _walk(next_prefix, child)
-            return
-        flattened[prefix] = current
-
-    _walk("", value)
-    return flattened
-
-
-def _convert_special_timestamp(value: Any, field_mapping: dict[str, Any]) -> str:
-    """Handle mapping-specific timestamp encodings before writing @timestamp."""
-
-    timestamp_kind = field_mapping.get("is_timestamp")
-    timestamp_format = field_mapping.get("timestamp_format")
-
-    if timestamp_kind == "windows_filetime":
-        base = datetime(1601, 1, 1, tzinfo=timezone.utc)
-        dt = base + timedelta(microseconds=int(value) / 10)
-        return normalize_timestamp(dt)
-    if timestamp_kind == "chrome":
-        base = datetime(1601, 1, 1, tzinfo=timezone.utc)
-        dt = base + timedelta(microseconds=float(value))
-        return normalize_timestamp(dt)
-    if timestamp_kind == "generic":
-        return normalize_timestamp(value, timestamp_format)
-    return normalize_timestamp(value, timestamp_format)
-
-
-def _transform_scalar(value: Any, field_mapping: dict[str, Any]) -> Any:
-    """Apply lightweight scalar transforms declared in the mapping for one source field."""
-
-    transformed = value
-
-    if field_mapping.get("multiplier") is not None and transformed is not None:
-        transformed = float(transformed) * float(field_mapping["multiplier"])
-
-    force_type = field_mapping.get("force_type")
-    if force_type == "int":
-        transformed = int(transformed)
-    elif force_type == "float":
-        transformed = float(transformed)
-    elif force_type == "str":
-        transformed = str(transformed)
-
-    return transformed
-
-
 def _should_process_source_field(mapping: dict[str, Any], source_field: str) -> bool:
-    """Apply mapping-level include/exclude rules to one source field name."""
+    """Apply mapping include/exclude constraints to one source field name."""
 
     include_fields = mapping.get("include") or []
     exclude_fields = mapping.get("exclude") or []
@@ -499,7 +590,14 @@ def _should_process_source_field(mapping: dict[str, Any], source_field: str) -> 
 
 
 def _should_preserve_source_field(mapping: dict[str, Any], source_field: str) -> bool:
-    """Keep only unmapped source fields in the preserved raw payload."""
+    """Decide whether an original source field should be preserved in output.
+
+    Preservation is intended for unmapped payload context while avoiding:
+
+    - OpenSearch metadata keys
+    - fields explicitly mapped to ECS/gULP targets
+    - fields removed by include/exclude constraints
+    """
 
     opensearch_metadata_fields = {
         "_id",
@@ -529,7 +627,11 @@ async def _ensure_context_id(
     context_name: str,
     cache: dict[str, str],
 ) -> str:
-    """Create or fetch a context once and cache its ID for subsequent records."""
+    """Resolve a context id from context name with in-run memoization.
+
+    Context creation in gULP is idempotent for existing names under operation,
+    but memoization avoids duplicate API calls during large ingest loops.
+    """
 
     if context_name in cache:
         return cache[context_name]
@@ -546,7 +648,7 @@ async def _ensure_source_id(
     source_name: str,
     cache: dict[tuple[str, str], str],
 ) -> str:
-    """Create or fetch a source once per (context, source_name) tuple."""
+    """Resolve a source id from source name with per-context memoization."""
 
     key = (context_id, source_name)
     if key in cache:
@@ -571,24 +673,45 @@ async def map_record_to_gulp_document(
     context_cache: dict[str, str],
     source_cache: dict[tuple[str, str], str],
 ) -> dict[str, Any]:
-    """Convert one Dissect record into a raw GulpDocument payload.
+    """Map one Dissect record into a gULP raw document payload.
 
-    The raw plugin does not apply arbitrary source mappings for us, so the CLI must
-    preserve the original Dissect fields, materialize ECS targets locally, and resolve
-    context/source names into stable IDs before upload.
+    This performs all per-record transformations required for ingest compatibility:
+
+    - preserve selected unmapped fields
+    - generate `event.original` and `event.sequence`
+    - map source fields to ECS targets
+    - coerce/transform values according to mapping directives
+    - normalize timestamp output
+    - apply value aliases
+    - resolve/assign `gulp.context_id` and `gulp.source_id`
+
+    Args:
+        client: Active gULP client used for context/source resolution.
+        cfg: Runtime configuration.
+        spec: Validated mapping specification for this plugin stream.
+        raw_record: Source Dissect record as plain dictionary.
+        event_sequence: Sequence value assigned to `event.sequence`.
+        context_cache: In-memory cache for context id lookups.
+        source_cache: In-memory cache for source id lookups.
+
+    Returns:
+        JSON-serializable mapped document dictionary.
+
+    Raises:
+        ValueError: If required mapped values cannot be resolved.
     """
 
     fields = spec.mapping.get("fields", {})
-    # Start from the full original record so unmapped Dissect fields are still present
-    # in the final GulpDocument, but still honor mapping include/exclude rules.
+    # Preserve unmapped original fields while still filtering source metadata and
+    # respecting include/exclude rules. This keeps event.original informative.
     mapped: dict[str, Any] = {
         key: deepcopy(value)
         for key, value in raw_record.items()
         if _should_preserve_source_field(spec.mapping, key)
     }
-    raw_record.pop(
-        "_generated", None
-    )  # either it will generated different documents depending on ingestion time
+
+    # Remove extraction-only metadata from the canonical event.original payload.
+    raw_record.pop("_generated", None)
     mapped.update(
         {
             "event.original": json.dumps(raw_record, sort_keys=True, default=str),
@@ -601,6 +724,7 @@ async def map_record_to_gulp_document(
     source_id = cfg.source_id
     context_name = spec.mapping.get("default_context") if context_id is None else None
     source_name = spec.mapping.get("default_source") if source_id is None else None
+    value_aliases = spec.mapping.get("value_aliases") or {}
 
     for source_field, field_mapping in fields.items():
         if (
@@ -615,10 +739,14 @@ async def map_record_to_gulp_document(
             continue
 
         gulp_type = field_mapping.get("is_gulp_type")
-        transformed = _transform_scalar(raw_value, field_mapping)
+        transformed = transform_scalar(
+            raw_value,
+            force_type=mapping_attr(field_mapping, "force_type"),
+            multiplier=mapping_attr(field_mapping, "multiplier"),
+        )
 
-        if field_mapping.get("flatten_json"):
-            mapped.update(_flatten_json_value(transformed))
+        if mapping_attr(field_mapping, "flatten_json"):
+            mapped.update(flatten_json_value(transformed))
 
         if gulp_type == "context_id" and context_id is None:
             context_id = str(transformed)
@@ -637,9 +765,20 @@ async def map_record_to_gulp_document(
 
         for ecs_field in ecs_targets:
             if ecs_field == "@timestamp":
-                mapped[ecs_field] = _convert_special_timestamp(raw_value, field_mapping)
+                mapped[ecs_field] = convert_special_timestamp(
+                    raw_value,
+                    timestamp_kind=mapping_attr(field_mapping, "is_timestamp"),
+                    timestamp_format=mapping_attr(field_mapping, "timestamp_format"),
+                    output="iso8601",
+                )
             else:
                 mapped[ecs_field] = transformed
+
+            # Apply aliases to each mapped ECS field using the same helper as gULP.
+            if value_aliases:
+                alias_target = {ecs_field: mapped[ecs_field]}
+                apply_value_aliases(ecs_field, alias_target, value_aliases)
+                mapped[ecs_field] = alias_target[ecs_field]
 
     if "@timestamp" not in mapped:
         raise ValueError(f"record missing mapped @timestamp for plugin '{spec.plugin}'")
@@ -674,6 +813,11 @@ async def map_record_to_gulp_document(
 
 
 def _to_jsonable(value: Any) -> Any:
+    """Recursively convert arbitrary values into JSON-safe primitives.
+
+    This utility is used when normalizing Dissect records that may expose custom
+    objects, bytes, sets, or datetimes.
+    """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, bytes):
@@ -688,7 +832,17 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def record_to_dict(record: Any) -> dict[str, Any]:
-    """Convert a Dissect record object into a plain JSON-safe dictionary."""
+    """Convert a Dissect record container into a plain dictionary.
+
+    Supported record shapes:
+
+    - dictionaries
+    - namedtuple-like objects exposing `_asdict()`
+    - objects exposing `__dict__` (excluding private attributes)
+
+    Raises:
+        ValueError: If record type cannot be converted safely.
+    """
 
     if isinstance(record, dict):
         return _to_jsonable(record)
@@ -700,6 +854,98 @@ def record_to_dict(record: Any) -> dict[str, Any]:
     raise ValueError(f"Unsupported record type: {type(record)!r}")
 
 
+def _passes_ingestion_filter(
+    mapped_record: dict[str, Any],
+    flt: GulpIngestionFilter | None,
+) -> bool:
+    """Evaluate one mapped record against client-side ingestion filtering rules.
+
+    Filter contract:
+
+    - if no filter is provided, every document is accepted
+    - if `storage_ignore_filter` is true, every document is accepted
+    - all configured conditions are combined as logical AND
+    - `time_range` is applied to `gulp.timestamp` when present, otherwise to a
+      converted `@timestamp`
+    - extra filter keys (`model_extra`) support:
+      - string equality: `{ "field": "value" }`
+      - numeric equality: `{ "field": 42 }`
+      - numeric range: `{ "field": {"gte": 10, "lte": 20} }`
+
+    Args:
+        mapped_record: Fully mapped document candidate.
+        flt: Optional parsed ingestion filter.
+
+    Returns:
+        `True` when record should be ingested, otherwise `False`.
+    """
+
+    def _is_number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _matches_model_extra(value: Any, condition: Any) -> bool:
+        # string comparison: strict equality
+        if isinstance(condition, str):
+            return isinstance(value, str) and value == condition
+
+        # number comparison: direct equality
+        if _is_number(condition):
+            return _is_number(value) and value == condition
+
+        # number comparison with explicit operators
+        if isinstance(condition, dict):
+            if not _is_number(value):
+                return False
+
+            allowed = {"gte", "lte"}
+            if not condition or any(k not in allowed for k in condition):
+                return False
+
+            for op, op_value in condition.items():
+                if not _is_number(op_value):
+                    return False
+                if op == "gte" and value < op_value:
+                    return False
+                if op == "lte" and value > op_value:
+                    return False
+
+            return True
+
+        return False
+
+    if flt is None or flt.storage_ignore_filter:
+        return True
+
+    # 1) apply time_range when present
+    if flt.time_range and len(flt.time_range) == 2:
+        start, end = flt.time_range
+        if not (start == 0 and end == 0):
+            ts_nanos = mapped_record.get("gulp.timestamp")
+            if not isinstance(ts_nanos, int):
+                try:
+                    ts_nanos = muty.time.string_to_nanos_from_unix_epoch(
+                        mapped_record.get("@timestamp"),
+                        throw_on_invalid=True,
+                    )
+                except Exception:
+                    ts_nanos = None
+            if ts_nanos is not None:
+                if start > 0 and ts_nanos < start:
+                    return False
+                if end > 0 and ts_nanos > end:
+                    return False
+
+    # 2) apply extra field filters from model_extra
+    extras = flt.model_extra or {}
+    for field_name, condition in extras.items():
+        if field_name not in mapped_record:
+            return False
+        if not _matches_model_extra(mapped_record[field_name], condition):
+            return False
+
+    return True
+
+
 def _pick_function(plugin_name: str, target: Target) -> FunctionDescriptor:
     """Resolve the requested Dissect plugin/function name to one executable descriptor."""
 
@@ -709,6 +955,7 @@ def _pick_function(plugin_name: str, target: Target) -> FunctionDescriptor:
     if not descriptors:
         raise ValueError(f"No dissect plugin function found for '{plugin_name}'")
 
+    # Prefer an exact name match, then a path-based match, otherwise fallback.
     for desc in descriptors:
         if desc.name == plugin_name:
             return desc
@@ -750,17 +997,45 @@ async def ingest_spec(
     spec: ResolvedExtractSpec,
     max_records: int | None = None,
 ) -> int:
-    """Extract, transform, and ingest one Dissect plugin stream in raw chunks."""
+    """Extract, transform, filter, and ingest records for a single spec.
+
+    Processing order:
+
+    1. iterate Dissect records for selected plugin
+    2. map each record into gULP raw-document shape
+    3. apply optional client-side ingestion filter
+    4. append accepted documents to chunk buffer
+    5. flush chunks to `/ingest_raw` using a shared request id
+
+    Limit semantics:
+
+    - `max_records` is applied to accepted records only
+    - filtered-out records do not count toward the limit
+
+    Args:
+        client: Active gULP client.
+        cfg: Runtime configuration.
+        target: Opened Dissect target.
+        spec: Resolved extract specification.
+        max_records: Optional cap of accepted records for this spec.
+
+    Returns:
+        Number of accepted records ingested for this spec.
+
+    Raises:
+        RuntimeError: If `/ingest_raw` reports a failing status.
+    """
 
     req_id = str(uuid.uuid4())
     chunk: list[dict[str, Any]] = []
     total = 0
+    accepted_total = 0
     context_cache: dict[str, str] = {}
     source_cache: dict[tuple[str, str], str] = {}
     progress = None if cfg.verbose else _make_progress_bar(spec)
 
     async def _flush(last: bool) -> None:
-        # Keep request tracking stable across all chunks for this extract spec.
+        """Send the current chunk to `/ingest_raw` and clear local buffer."""
         if not chunk:
             return
         result = await client.ingest.raw(
@@ -770,6 +1045,9 @@ async def ingest_spec(
             params={
                 "req_id": req_id,
                 "last": last,
+                "plugin_params": {
+                    "mapping_parameters": deepcopy(spec.mapping_parameters),
+                },
             },
             wait=last,
             timeout=3600,
@@ -783,7 +1061,7 @@ async def ingest_spec(
 
     try:
         for raw_record in iter_plugin_records(target, spec.plugin):
-            if max_records is not None and total >= max_records:
+            if max_records is not None and accepted_total >= max_records:
                 break
 
             total += 1
@@ -796,6 +1074,11 @@ async def ingest_spec(
                 context_cache,
                 source_cache,
             )
+
+            if not _passes_ingestion_filter(mapped_record, cfg.flt):
+                continue
+
+            accepted_total += 1
             if cfg.verbose:
                 print(json.dumps(mapped_record, sort_keys=True, default=str))
             elif progress is not None:
@@ -810,18 +1093,30 @@ async def ingest_spec(
         if progress is not None:
             progress.close()
 
-    return total
+    return accepted_total
 
 
 async def _reset_operation(client: GulpClient, operation_id: str) -> None:
-    """Clear (recreate) operation"""
+    """Delete and recreate the target operation before ingestion.
+
+    This is destructive and intended for clean-slate ingest runs.
+    """
 
     await client.operations.delete(operation_id, force=True)
     await client.operations.create(name=operation_id)
 
 
 async def run(cfg: AppConfig, specs: list[ResolvedExtractSpec]) -> None:
-    """Run the full extraction workflow for all requested plugin/mapping tuples."""
+    """Execute the full end-to-end `gulp-dissect` workflow.
+
+    High-level flow:
+
+    - open target image
+    - authenticate to gULP and ensure websocket session
+    - optionally reset operation
+    - ingest each extract spec sequentially while enforcing global `--limit`
+    - attempt logout in finally block
+    """
 
     target = Target.open(cfg.image_path)
 
@@ -866,11 +1161,21 @@ async def run(cfg: AppConfig, specs: list[ResolvedExtractSpec]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point for the CLI.
+
+    Wrap execution with banner/log setup and top-level error handling.
+
+    Returns:
+        Process-style exit code (`0` for success, `1` for failure).
+    """
+    banner = art.text2art("gulp-dissect", font="random")
+    print(banner)
+    MutyLogger.get_instance(name="gulp-dissect")
     try:
         args = parse_args(argv)
         cfg = build_config(args)
         specs_raw = collect_extract_specs(args)
-        specs = resolve_specs(specs_raw, cfg)
+        specs = asyncio.run(resolve_specs(specs_raw, cfg))
         asyncio.run(run(cfg, specs))
         return 0
     except Exception as exc:

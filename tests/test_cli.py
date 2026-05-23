@@ -1,12 +1,16 @@
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
+from gulp.api.opensearch.filters import GulpIngestionFilter
 
 from gulp_dissect.cli import (
+    _passes_ingestion_filter,
     AppConfig,
     build_config,
     collect_extract_specs,
+    ingest_spec,
     map_record_to_gulp_document,
     normalize_timestamp,
     parse_args,
@@ -25,9 +29,18 @@ def _cfg(context_id=None, source_id=None):
         chunk_size=1000,
         context_id=context_id,
         source_id=source_id,
+        flt=None,
         reset_operation=False,
         verbose=False,
     )
+
+
+def _resolve_specs(specs_raw, cfg):
+    return asyncio.run(_resolve_specs_async(specs_raw, cfg))
+
+
+async def _resolve_specs_async(specs_raw, cfg):
+    return await resolve_specs(specs_raw, cfg)
 
 
 def test_collect_extract_specs_from_repeated_pairs():
@@ -93,8 +106,6 @@ def test_collect_extract_specs_from_extract_file(tmp_path: Path):
     assert len(specs) == 1
     assert specs[0]["plugin"] == "evt"
 
-
-def test_build_config_enables_verbose_flag():
     args = parse_args(
         [
             "--image_path",
@@ -238,6 +249,155 @@ def test_build_config_enables_reset_operation_flag():
     assert cfg.reset_operation is True
 
 
+def test_build_config_parses_flt_json():
+    args = parse_args(
+        [
+            "--image_path",
+            "/tmp/image.img",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--gulp_url",
+            "http://localhost:8080",
+            "--operation_id",
+            "test_operation",
+            "--flt",
+            '{"time_range":[1704067200000000000,1704153600000000000]}',
+        ]
+    )
+    cfg = build_config(args)
+    assert isinstance(cfg.flt, GulpIngestionFilter)
+    assert cfg.flt.time_range == (1704067200000000000, 1704153600000000000)
+
+
+def test_build_config_rejects_non_object_flt():
+    args = parse_args(
+        [
+            "--image_path",
+            "/tmp/image.img",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--gulp_url",
+            "http://localhost:8080",
+            "--operation_id",
+            "test_operation",
+            "--flt",
+            '["not-an-object"]',
+        ]
+    )
+    with pytest.raises(ValueError, match="flt"):
+        build_config(args)
+
+
+def test_build_config_rejects_invalid_flt_object_shape():
+    args = parse_args(
+        [
+            "--image_path",
+            "/tmp/image.img",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--gulp_url",
+            "http://localhost:8080",
+            "--operation_id",
+            "test_operation",
+            "--flt",
+            '{"time_range":{"start":1,"end":2}}',
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid flt"):
+        build_config(args)
+
+
+def test_passes_ingestion_filter_model_extra_string_and_number_ops_with_and():
+    flt = GulpIngestionFilter.model_validate(
+        {
+            "time_range": [1704067200000000000, 1704067200000000000],
+            "event.category": "authentication",
+            "event.severity": {"gte": 3, "lte": 5},
+            "event.risk_score": 7,
+        }
+    )
+
+    good = {
+        "@timestamp": "2024-01-01T00:00:00Z",
+        "event.category": "authentication",
+        "event.severity": 4,
+        "event.risk_score": 7,
+    }
+    assert _passes_ingestion_filter(good, flt) is True
+
+    bad_time = {
+        "@timestamp": "2024-01-02T00:00:00Z",
+        "event.category": "authentication",
+        "event.severity": 4,
+        "event.risk_score": 7,
+    }
+    assert _passes_ingestion_filter(bad_time, flt) is False
+
+    bad_string = {
+        "@timestamp": "2024-01-01T00:00:00Z",
+        "event.category": "process",
+        "event.severity": 4,
+        "event.risk_score": 7,
+    }
+    assert _passes_ingestion_filter(bad_string, flt) is False
+
+    bad_number = {
+        "@timestamp": "2024-01-01T00:00:00Z",
+        "event.category": "authentication",
+        "event.severity": 6,
+        "event.risk_score": 7,
+    }
+    assert _passes_ingestion_filter(bad_number, flt) is False
+
+
+def test_passes_ingestion_filter_model_extra_rejects_missing_or_invalid_conditions():
+    missing_field_flt = GulpIngestionFilter.model_validate({"event.category": "auth"})
+    assert (
+        _passes_ingestion_filter(
+            {"@timestamp": "2024-01-01T00:00:00Z"}, missing_field_flt
+        )
+        is False
+    )
+
+    unsupported_condition_flt = GulpIngestionFilter.model_validate(
+        {"event.severity": {"gt": 3}}
+    )
+    assert (
+        _passes_ingestion_filter(
+            {"@timestamp": "2024-01-01T00:00:00Z", "event.severity": 4},
+            unsupported_condition_flt,
+        )
+        is False
+    )
+
+    unsupported_equal_flt = GulpIngestionFilter.model_validate(
+        {"event.severity": {"equal": 4}}
+    )
+    assert (
+        _passes_ingestion_filter(
+            {"@timestamp": "2024-01-01T00:00:00Z", "event.severity": 4},
+            unsupported_equal_flt,
+        )
+        is False
+    )
+
+
+def test_passes_ingestion_filter_invalid_timestamp_string_is_not_forced_to_zero():
+    flt = GulpIngestionFilter.model_validate(
+        {"time_range": [1704067200000000000, 1704153600000000000]}
+    )
+
+    # Parsing failures should not be treated as timestamp=0, otherwise records
+    # could be incorrectly rejected when start > 0.
+    assert _passes_ingestion_filter({"@timestamp": "not-a-timestamp"}, flt) is True
+
+
 def test_resolve_specs_enforces_context_source_without_overrides():
     specs_raw = [
         {
@@ -257,7 +417,7 @@ def test_resolve_specs_enforces_context_source_without_overrides():
     ]
 
     with pytest.raises(ValueError, match="context_name"):
-        resolve_specs(specs_raw, _cfg())
+        _resolve_specs(specs_raw, _cfg())
 
 
 def test_resolve_specs_accepts_context_source_overrides_and_injects_id_mapping():
@@ -278,7 +438,7 @@ def test_resolve_specs_accepts_context_source_overrides_and_injects_id_mapping()
         }
     ]
 
-    resolved = resolve_specs(specs_raw, _cfg(context_id="ctx123", source_id="src456"))
+    resolved = _resolve_specs(specs_raw, _cfg(context_id="ctx123", source_id="src456"))
     assert resolved[0].mapping_id == "m1"
     assert resolved[0].plugin == "evt"
 
@@ -303,8 +463,78 @@ def test_resolve_specs_fallbacks_timestamp_to_ts():
         }
     ]
 
-    resolved = resolve_specs(specs_raw, _cfg())
+    resolved = _resolve_specs(specs_raw, _cfg())
     assert resolved[0].timestamp_fields == ["ts"]
+
+
+def test_resolve_specs_supports_mapping_file_like_gulp(tmp_path: Path):
+    mapping_file = tmp_path / "mapping.json"
+    mapping_file.write_text(
+        json.dumps(
+            {
+                "mappings": {
+                    "m1": {
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        }
+                    }
+                },
+                "metadata": {"plugin": ["evt"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mapping_file": str(mapping_file),
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    resolved = _resolve_specs(specs_raw, _cfg())
+    assert resolved[0].mapping_id == "m1"
+    assert resolved[0].timestamp_fields == ["ts"]
+    assert resolved[0].event_code_fields == ["EventCode"]
+
+
+def test_resolve_specs_supports_mapping_scoped_value_aliases():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "value_aliases": {
+                            "event.code": {
+                                "default": {
+                                    "4624": "bingo",
+                                }
+                            }
+                        },
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    resolved = _resolve_specs(specs_raw, _cfg())
+    assert (
+        resolved[0].mapping["value_aliases"]["event.code"]["default"]["4624"] == "bingo"
+    )
 
 
 def test_normalize_timestamp_to_iso_utc():
@@ -329,6 +559,33 @@ class _FakeClient:
         self.operations = _FakeOperations()
 
 
+class _FakeIngestApi:
+    def __init__(self):
+        self.calls = []
+
+    async def raw(self, operation_id, plugin_name, data, params, wait, timeout):
+        self.calls.append(
+            {
+                "operation_id": operation_id,
+                "plugin_name": plugin_name,
+                "data": list(data),
+                "params": params,
+                "wait": wait,
+                "timeout": timeout,
+            }
+        )
+
+        class _Result:
+            status = "completed"
+
+        return _Result()
+
+
+class _FakeIngestClient:
+    def __init__(self):
+        self.ingest = _FakeIngestApi()
+
+
 @pytest.mark.asyncio
 async def test_map_record_to_gulp_document_builds_raw_doc_from_mapping():
     specs_raw = [
@@ -350,7 +607,7 @@ async def test_map_record_to_gulp_document_builds_raw_doc_from_mapping():
             },
         }
     ]
-    spec = resolve_specs(specs_raw, _cfg())[0]
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
 
     doc = await map_record_to_gulp_document(
         _FakeClient(),
@@ -400,7 +657,7 @@ async def test_map_record_to_gulp_document_uses_explicit_ids_over_names():
         }
     ]
     cfg = _cfg(context_id="ctx-fixed", source_id="src-fixed")
-    spec = resolve_specs(specs_raw, cfg)[0]
+    spec = (await _resolve_specs_async(specs_raw, cfg))[0]
 
     doc = await map_record_to_gulp_document(
         _FakeClient(),
@@ -442,7 +699,7 @@ async def test_map_record_to_gulp_document_honors_exclude_and_maps_plan_fields()
             },
         }
     ]
-    spec = resolve_specs(specs_raw, _cfg())[0]
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
 
     doc = await map_record_to_gulp_document(
         _FakeClient(),
@@ -493,7 +750,7 @@ async def test_map_record_to_gulp_document_preserves_only_unmapped_fields():
             },
         }
     ]
-    spec = resolve_specs(specs_raw, _cfg())[0]
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
 
     doc = await map_record_to_gulp_document(
         _FakeClient(),
@@ -516,3 +773,123 @@ async def test_map_record_to_gulp_document_preserves_only_unmapped_fields():
     assert "EventCode" not in doc
     assert "hostname" not in doc
     assert "SourceName" not in doc
+
+
+@pytest.mark.asyncio
+async def test_map_record_to_gulp_document_applies_value_aliases_from_mapping_parameters():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "value_aliases": {
+                            "event.code": {
+                                "default": {
+                                    "4624": "bingo",
+                                }
+                            }
+                        },
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    doc = await map_record_to_gulp_document(
+        _FakeClient(),
+        _cfg(),
+        spec,
+        {
+            "ts": "2024-01-01T00:00:00Z",
+            "EventCode": 4624,
+            "hostname": "host-a",
+            "SourceName": "security",
+        },
+        1,
+        {},
+        {},
+    )
+
+    assert doc["event.code"] == "bingo"
+
+
+@pytest.mark.asyncio
+async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeypatch):
+    from gulp_dissect import cli as cli_module
+
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                        }
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    cfg = _cfg(context_id="ctx-fixed", source_id="src-fixed")
+    cfg.flt = GulpIngestionFilter(time_range=(1704067200000000000, 1704067200000000000))
+    cfg.chunk_size = 10
+    cfg.verbose = True
+    spec = (await _resolve_specs_async(specs_raw, cfg))[0]
+
+    monkeypatch.setattr(
+        cli_module,
+        "iter_plugin_records",
+        lambda target, plugin: iter([{"id": 1}, {"id": 2}]),
+    )
+
+    seq = {"value": 0}
+
+    async def _fake_map_record_to_gulp_document(
+        client,
+        cfg,
+        spec,
+        raw_record,
+        event_sequence,
+        context_cache,
+        source_cache,
+    ):
+        seq["value"] += 1
+        if seq["value"] == 1:
+            ts = "2024-01-01T00:00:00Z"
+        else:
+            ts = "2024-01-02T00:00:00Z"
+        return {
+            "@timestamp": ts,
+            "event.code": "4624",
+            "gulp.context_id": "ctx-fixed",
+            "gulp.source_id": "src-fixed",
+        }
+
+    monkeypatch.setattr(
+        cli_module,
+        "map_record_to_gulp_document",
+        _fake_map_record_to_gulp_document,
+    )
+
+    client = _FakeIngestClient()
+    ingested = await ingest_spec(client, cfg, target=None, spec=spec, max_records=None)
+
+    assert ingested == 1
+    assert len(client.ingest.calls) == 1
+    assert len(client.ingest.calls[0]["data"]) == 1
+    assert "flt" not in client.ingest.calls[0]["params"]
+    assert "plugin_params" in client.ingest.calls[0]["params"]
