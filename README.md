@@ -1,8 +1,9 @@
 - [gulp-dissect](#gulp-dissect)
   - [Install](#install)
   - [CLI](#cli)
-    - [tuples input on the command line](#tuples-input-on-the-command-line)
-    - [tuples input from a JSON file](#tuples-input-from-a-json-file)
+    - [set dissect plugin/s and provide mappings](#set-dissect-plugins-and-provide-mappings)
+      - [tuples input on the command line](#tuples-input-on-the-command-line)
+      - [tuples input from a JSON file](#tuples-input-from-a-json-file)
   - [Filtering with --flt](#filtering-with---flt)
   - [Required Mapping Validation](#required-mapping-validation)
   - [Notes](#notes)
@@ -22,33 +23,78 @@ cd gulp-dissect
 
 ## CLI
 
+~~~bash
+# show usage
+ gulp-dissect --help
+                       .;                                                                  .   
+                      .;'                    .'     .-.                                ...;... 
+  ,:.,'    ,  :      .;   `..:.         .-..'       `-'      .      .   .-.   .-.       .'     
+ :   ;    ;   ;     ::     ;;  : `;;;. :   ;       ;'      .';    .'; .;.-'  ;        .;       
+  `-:'  .'`..:;._ _;;_.-   ;;_.`       `:::'`.  _.;:._.  .' .'  .' .'  `:::' `;;;;' .;         
+-._:'                     .;'                           '      '                               
+
+2026-05-23 17:28:24,623|gulp-dissect||DEBUG|28599,28599|_reconfigure|"muty/log.py", line 245|logger "<TraceLogger gulp-dissect (DEBUG)>" configured!
+usage: gulp-dissect [-h] [--image_path IMAGE_PATH] [--username USERNAME] [--password PASSWORD] [--gulp_url GULP_URL]
+                    [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk_size CHUNK_SIZE] [--context_id CONTEXT_ID]
+                    [--source_id SOURCE_ID] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT] [--reset-operation]
+                    [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS] [--extract_rules EXTRACT_RULES]
+
+Extract data from a forensic image with Dissect and ingest mapped records into gULP via ingest_raw.
+
+options:
+  -h, --help            show this help message and exit
+  --image_path IMAGE_PATH
+                        absolute path to the forensic disk image to process (default: None)
+  --username USERNAME   gULP username (or set GULP_DISSECT_USERNAME) (default: None)
+  --password PASSWORD   gULP password (or set GULP_DISSECT_PASSWORD) (default: None)
+  --gulp_url GULP_URL   gULP base URL, e.g. http://localhost:8080 (or set GULP_DISSECT_URL) (default: None)
+  --operation_id OPERATION_ID
+                        existing gULP operation id where documents will be ingested (default: None)
+  --limit LIMIT         maximum number of records to ingest across all extract tuples; 0 means no limit (default: None)
+  --chunk_size CHUNK_SIZE
+                        number of mapped records sent per ingest_raw chunk (default: None)
+  --context_id CONTEXT_ID
+                        explicit existing context id; if omitted, mapping must provide an is_gulp_type=context_name field
+                        (default: None)
+  --source_id SOURCE_ID
+                        explicit existing source id; if omitted, mapping must provide an is_gulp_type=source_name field (default:
+                        None)
+  --mapping_files_base_path MAPPING_FILES_BASE_PATH
+                        base path used to resolve relative mapping file paths (or set GULP_DISSECT_MAPPING_FILES_BASE_PATH)
+                        (default: None)
+  --flt FLT             optional GulpIngestionFilter JSON object applied client-side before ingest_raw calls (default: None)
+  --reset-operation     delete and recreate the target operation before ingestion (destructive) (default: False)
+  --verbose             print each mapped GulpDocument as JSON instead of showing the progress bar (default: False)
+  --plugin PLUGIN       Dissect plugin/function name for one extract tuple; repeat with --mapping_parameters (default: [])
+  --mapping_parameters MAPPING_PARAMETERS
+                        JSON object (or @file.json) for one extract tuple mapping_parameters; must match --plugin occurrences,
+                        all paths inside must be absolute paths unless --mapping_files_base_path is set (default: [])
+  --extract_rules EXTRACT_RULES
+                        JSON file containing one extract tuple object or a list of tuple objects with shape: {plugin,
+                        mapping_parameters}; repeatable (default: [])
+~~~
+
 Environment variables are supported only for:
 
-- `--username` (or `GULP_DISSECT_USERNAME`)
-- `--password` (or `GULP_DISSECT_PASSWORD`)
-- `--gulp_url` (or `GULP_DISSECT_URL`)
+- `--username` (env `GULP_DISSECT_USERNAME`)
+- `--password` (env `GULP_DISSECT_PASSWORD`)
+- `--gulp_url` (env `GULP_DISSECT_URL`)
+- `--mapping_files_base_path` (env `GULP_DISSECT_MAPPING_FILES_BASE_PATH`)
 
-All other options are command-line only:
+All other options are command-line only.  
 
-- `--image_path`: path to the forensic disc image to be dissected
-- `--operation_id`: the operation in gulp to ingest data into. this operation must already exist before running the tool.
-- `--limit` (default: `0`) maximum number of records to ingest across all extract specs (`0` means no limit)
-- `--reset-operation` clears existing data in the target operation before ingest while keeping the operation itself
-- `--chunk_size` (default: `1000`)
-- `--context_id`: optional, the id of an existing `GulpContext` to be used for ingested documents, to be set in each `GulpDocument` as `gulp.context_id`. if not provided, a field in the currently processed mapping must have `is_type` defined as `context_name`. if neither is provided, the tool should notify the error and fail.
-- `--source_id`: optional, the id of an existing `GulpSource` to be used for ingested documents, to be set in each `GulpDocument` as `gulp.source_id`. if not provided, a field in the currently processed mapping must have `is_type` defined as `source_name`. if neither is provided, the tool should notify the error and fail.
-- `--flt`: optional `GulpIngestionFilter` JSON object applied client-side before calling `/ingest_raw`
-- `--verbose` prints each generated GulpDocument as JSON; by default the CLI shows a progress bar instead
+### set dissect plugin/s and provide mappings
 
-You must provide one or more extract tuples (`plugin`, `GulpMappingParameters`) using one of these forms:
+`mapping_parameters` and related mapping format follows the same format as in [gulp](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-101) and are parsed using imported gulp's code.
 
-> GulpMappingParameters and related mapping format follows the same format as in [gulp](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-101) and are parsed using imported gulp's code.
-> the only difference is not all flags are supported. specifically:
->
-> 1. `is_gulp_type` is supported only for `context_name` and `source_name` to allow auto-assigning `gulp.context_id` and `gulp.source_id` respectively when the corresponding CLI flags are not provided.
-> 2. `extra_doc_with_event_code` is currently not supported
+the only difference is not all flags are supported. specifically:
 
-### tuples input on the command line
+1. `is_gulp_type` is supported only for `context_name` and `source_name` to allow auto-assigning `gulp.context_id` and `gulp.source_id` respectively when the corresponding CLI flags are not provided.
+2. `extra_doc_with_event_code` is currently not supported (and possibly never will be)
+
+`--plugin` and `--mapping_parameters` must be provided using one of these forms:
+
+#### tuples input on the command line
 
 One or more `--plugin` / `--mapping_parameters` pairs for multiple plugins (processed sequentially):
 
@@ -63,40 +109,11 @@ gulp-dissect \
   # --plugin mft --mapping_parameters '...'
 ```
 
-### tuples input from a JSON file
+#### tuples input from a JSON file
 
-a JSON file containing one tuple object or a list of tuple objects using `--extract_file /path/to/extracts.json`.
+a JSON file containing one or more tuples using `--extract_rules /path/to/extracts.json`.
 
-Example `extracts.json`:
-
-```json
-[
-  {
-    "plugin": "evt",
-    "mapping_parameters": {
-      "mappings": {
-        "dissect_evt": {
-          "fields": {
-            "ts": {"ecs": ["@timestamp"]},
-            "EventCode": {"ecs": ["event.code"]},
-            "hostname": {"is_gulp_type": "context_name"},
-            "SourceName": {"is_gulp_type": "source_name"},
-            "_source": {"ecs": ["log.file_path"]}
-          }
-        }
-      },
-      "mapping_id": "dissect_evt"
-    }
-  },
-  {
-    "plugin": "mft",
-    "mapping_parameters": {
-      "mapping_file": "/mapping_files/dissect_mft_mapping.json",
-      "mapping_id": "dissect_mft"
-    }
-  }
-]
-```
+[Example extract_rules](./extract_rules_sample.json)
 
 Run with file-based tuples:
 
@@ -106,12 +123,25 @@ gulp-dissect \
   --username admin --password admin \
   --gulp_url http://localhost:8080 \
   --operation_id test_operation \
-  --extract_file /tmp/extracts.json
+  --extract_rules ./extract_rules_sample.json
+```
+
+Run with relative mapping files resolved from an explicit base path:
+
+```bash
+gulp-dissect \
+  --image_path /gulp/img/SCHARDT.img \
+  --username admin --password admin \
+  --gulp_url http://localhost:8080 \
+  --operation_id test_operation \
+  --plugin mft \
+  --mapping_parameters '{"mapping_file":"dissect_mft.json","mapping_id":"mft"}' \
+  --mapping_files_base_path /gulp/gulp-dissect/mapping_files
 ```
 
 `mapping_parameters` accepts either:
 
-- `{ "mapping_file": "/abs/path/to/file.json", "mapping_id": "..." }`
+- `{ "mapping_file": "/path/to/file.json", "mapping_id": "..." }`
 - `{ "mappings": { "id": { ...GulpMapping... } }, "mapping_id": "id" }`
 
 ## Filtering with --flt

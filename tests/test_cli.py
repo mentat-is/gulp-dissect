@@ -29,6 +29,7 @@ def _cfg(context_id=None, source_id=None):
         chunk_size=1000,
         context_id=context_id,
         source_id=source_id,
+        mapping_files_base_path=None,
         flt=None,
         reset_operation=False,
         verbose=False,
@@ -143,6 +144,52 @@ def test_build_config_uses_env_for_auth_and_url_only(monkeypatch: pytest.MonkeyP
     assert cfg.username == "env-user"
     assert cfg.password == "env-pass"
     assert cfg.gulp_url == "http://env:8080"
+
+
+def test_build_config_parses_mapping_files_base_path_from_cli():
+    args = parse_args(
+        [
+            "--image_path",
+            "/tmp/image.img",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--gulp_url",
+            "http://localhost:8080",
+            "--operation_id",
+            "test_operation",
+            "--mapping_files_base_path",
+            "/tmp/mappings",
+        ]
+    )
+
+    cfg = build_config(args)
+    assert cfg.mapping_files_base_path == "/tmp/mappings"
+
+
+def test_build_config_parses_mapping_files_base_path_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("GULP_DISSECT_MAPPING_FILES_BASE_PATH", "/env/mappings")
+
+    args = parse_args(
+        [
+            "--image_path",
+            "/tmp/image.img",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--gulp_url",
+            "http://localhost:8080",
+            "--operation_id",
+            "test_operation",
+        ]
+    )
+
+    cfg = build_config(args)
+    assert cfg.mapping_files_base_path == "/env/mappings"
 
 
 def test_build_config_rejects_missing_image_path_even_if_env_present(
@@ -443,6 +490,31 @@ def test_resolve_specs_accepts_context_source_overrides_and_injects_id_mapping()
     assert resolved[0].plugin == "evt"
 
 
+def test_resolve_specs_allows_missing_event_code_mapping_with_event_code_override():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "event_code": "4624",
+                "mappings": {
+                    "m1": {
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        }
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    resolved = _resolve_specs(specs_raw, _cfg())
+    assert resolved[0].mapping_id == "m1"
+    assert resolved[0].event_code_fields == []
+
+
 def test_resolve_specs_fallbacks_timestamp_to_ts():
     specs_raw = [
         {
@@ -504,6 +576,44 @@ def test_resolve_specs_supports_mapping_file_like_gulp(tmp_path: Path):
     assert resolved[0].event_code_fields == ["EventCode"]
 
 
+def test_resolve_specs_mapping_file_allows_mapping_event_code_without_event_code_field(
+    tmp_path: Path,
+):
+    mapping_file = tmp_path / "mapping_no_event_code_field.json"
+    mapping_file.write_text(
+        json.dumps(
+            {
+                "mappings": {
+                    "m1": {
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        },
+                        "event_code": "dissect_mft",
+                    }
+                },
+                "metadata": {"plugin": ["evt"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mapping_file": str(mapping_file),
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    resolved = _resolve_specs(specs_raw, _cfg())
+    assert resolved[0].mapping_id == "m1"
+    assert resolved[0].event_code_fields == []
+
+
 def test_resolve_specs_supports_mapping_scoped_value_aliases():
     specs_raw = [
         {
@@ -535,6 +645,65 @@ def test_resolve_specs_supports_mapping_scoped_value_aliases():
     assert (
         resolved[0].mapping["value_aliases"]["event.code"]["default"]["4624"] == "bingo"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_specs_passes_mapping_files_base_path_to_mapping_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from gulp_dissect import cli as cli_module
+
+    captured: dict[str, str | None] = {"mapping_base_path": None}
+
+    class _FakeMappingModel:
+        def model_dump(self):
+            return {
+                "fields": {
+                    "ts": {"ecs": ["@timestamp"]},
+                    "EventCode": {"ecs": ["event.code"]},
+                    "hostname": {"is_gulp_type": "context_name"},
+                    "SourceName": {"is_gulp_type": "source_name"},
+                }
+            }
+
+    async def _fake_mapping_parameters_to_mapping(
+        mapping_parameters,
+        mapping_base_path=None,
+    ):
+        captured["mapping_base_path"] = mapping_base_path
+        return ({"m1": _FakeMappingModel()}, "m1")
+
+    monkeypatch.setattr(
+        cli_module,
+        "mapping_parameters_to_mapping",
+        _fake_mapping_parameters_to_mapping,
+    )
+
+    cfg = _cfg()
+    cfg.mapping_files_base_path = "/tmp/base"
+
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        }
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    await _resolve_specs_async(specs_raw, cfg)
+
+    assert captured["mapping_base_path"] == "/tmp/base"
 
 
 def test_normalize_timestamp_to_iso_utc():
@@ -776,6 +945,64 @@ async def test_map_record_to_gulp_document_preserves_only_unmapped_fields():
 
 
 @pytest.mark.asyncio
+async def test_map_record_to_gulp_document_drops_generated_and_gulp_namespace_fields():
+    specs_raw = [
+        {
+            "plugin": "mft",
+            "mapping_parameters": {
+                "mappings": {
+                    "m1": {
+                        "event_code": "dissect_mft",
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "filesize": {"ecs": ["file.size"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                            "_source": {"ecs": ["log.file_path"]},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    doc = await map_record_to_gulp_document(
+        _FakeClient(),
+        _cfg(),
+        spec,
+        {
+            "ts": "2024-01-01T00:00:00Z",
+            "filesize": 123,
+            "hostname": "host-a",
+            "SourceName": "security",
+            "_source": "/path/to/mft",
+            "_generated": "drop-me",
+            "gulp.context_id": "raw-ctx",
+            "gulp.source_id": "raw-src",
+            "OtherField": "keep-me",
+        },
+        1,
+        {},
+        {},
+    )
+
+    assert "_generated" not in doc
+    assert "gulp.context_id" in doc
+    assert doc["gulp.context_id"].startswith("ctx::test_operation::")
+    assert "gulp.source_id" in doc
+    assert doc["gulp.source_id"].startswith("src::test_operation::")
+    assert "OtherField" in doc
+
+    event_original = json.loads(doc["event.original"])
+    assert "_generated" not in event_original
+    assert "gulp.context_id" not in event_original
+    assert "gulp.source_id" not in event_original
+
+
+@pytest.mark.asyncio
 async def test_map_record_to_gulp_document_applies_value_aliases_from_mapping_parameters():
     specs_raw = [
         {
@@ -821,6 +1048,92 @@ async def test_map_record_to_gulp_document_applies_value_aliases_from_mapping_pa
     )
 
     assert doc["event.code"] == "bingo"
+
+
+@pytest.mark.asyncio
+async def test_map_record_to_gulp_document_overrides_agent_type_from_mapping_parameters():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "agent_type": "override-agent",
+                "mappings": {
+                    "m1": {
+                        "agent_type": "mapping-agent",
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    doc = await map_record_to_gulp_document(
+        _FakeClient(),
+        _cfg(),
+        spec,
+        {
+            "ts": "2024-01-01T00:00:00Z",
+            "EventCode": 4624,
+            "hostname": "host-a",
+            "SourceName": "security",
+        },
+        1,
+        {},
+        {},
+    )
+
+    assert doc["agent.type"] == "override-agent"
+
+
+@pytest.mark.asyncio
+async def test_map_record_to_gulp_document_overrides_event_code_from_mapping_parameters():
+    specs_raw = [
+        {
+            "plugin": "evt",
+            "mapping_parameters": {
+                "event_code": "override-event",
+                "mappings": {
+                    "m1": {
+                        "event_code": "mapping-event",
+                        "fields": {
+                            "ts": {"ecs": ["@timestamp"]},
+                            "EventCode": {"ecs": ["event.code"]},
+                            "hostname": {"is_gulp_type": "context_name"},
+                            "SourceName": {"is_gulp_type": "source_name"},
+                        },
+                    }
+                },
+                "mapping_id": "m1",
+            },
+        }
+    ]
+
+    spec = (await _resolve_specs_async(specs_raw, _cfg()))[0]
+
+    doc = await map_record_to_gulp_document(
+        _FakeClient(),
+        _cfg(),
+        spec,
+        {
+            "ts": "2024-01-01T00:00:00Z",
+            "EventCode": 4624,
+            "hostname": "host-a",
+            "SourceName": "security",
+        },
+        1,
+        {},
+        {},
+    )
+
+    assert doc["event.code"] == "override-event"
 
 
 @pytest.mark.asyncio

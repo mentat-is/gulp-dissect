@@ -80,6 +80,8 @@ class AppConfig:
         chunk_size: Maximum documents sent per `/ingest_raw` request.
         context_id: Optional explicit context id override.
         source_id: Optional explicit source id override.
+        mapping_files_base_path: Optional base path used to resolve relative
+            mapping file paths in mapping parameters.
         flt: Optional client-side ingestion filter (`GulpIngestionFilter`).
         reset_operation: Whether to delete/recreate the operation before ingest.
         verbose: Whether to print mapped documents instead of showing progress.
@@ -94,6 +96,7 @@ class AppConfig:
     chunk_size: int
     context_id: str | None
     source_id: str | None
+    mapping_files_base_path: str | None
     flt: GulpIngestionFilter | None
     reset_operation: bool
     verbose: bool
@@ -232,6 +235,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--mapping_files_base_path",
+        help=(
+            "base path used to resolve relative mapping file paths "
+            "(or set GULP_DISSECT_MAPPING_FILES_BASE_PATH)"
+        ),
+    )
+    p.add_argument(
         "--flt",
         help=(
             "optional GulpIngestionFilter JSON object applied "
@@ -271,12 +281,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help=(
             "JSON object (or @file.json) for one extract tuple mapping_parameters; "
-            "must match --plugin occurrences"
+            "must match --plugin occurrences, all paths inside must be absolute paths unless --mapping_files_base_path is set"
         ),
     )
 
     p.add_argument(
-        "--extract_file",
+        "--extract_rules",
         action="append",
         default=[],
         help=(
@@ -313,6 +323,10 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     chunk_size_raw = args.chunk_size if args.chunk_size is not None else 1000
     context_id = args.context_id
     source_id = args.source_id
+    mapping_files_base_path = _env_or_arg(
+        args.mapping_files_base_path,
+        "GULP_DISSECT_MAPPING_FILES_BASE_PATH",
+    )
     flt_raw = args.flt
     reset_operation_raw = args.reset_operation
 
@@ -356,6 +370,9 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         chunk_size=chunk_size,
         context_id=str(context_id) if context_id else None,
         source_id=str(source_id) if source_id else None,
+        mapping_files_base_path=(
+            str(mapping_files_base_path) if mapping_files_base_path else None
+        ),
         flt=flt,
         reset_operation=str(reset_operation_raw).lower() in {"1", "true", "yes", "on"},
         verbose=bool(args.verbose),
@@ -368,7 +385,7 @@ def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
     Supported forms:
 
     - repeated `--plugin` + `--mapping_parameters` pairs (1:1)
-    - one or more `--extract_file` JSON files containing one tuple object or a
+    - one or more `--extract_rules` JSON files containing one tuple object or a
       list of tuple objects.
 
     Args:
@@ -397,9 +414,9 @@ def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
                 {"plugin": plugin, "mapping_parameters": _read_json_arg(mapping_raw)}
             )
 
-    for extract_file in args.extract_file:
+    for extract_rules in args.extract_rules:
         # Accept either a single tuple object or a list of tuple objects.
-        loaded = json.loads(Path(extract_file).read_text(encoding="utf-8"))
+        loaded = json.loads(Path(extract_rules).read_text(encoding="utf-8"))
         if isinstance(loaded, list):
             specs.extend(loaded)
         else:
@@ -429,6 +446,7 @@ def _normalize_mapping(
     mapping: dict[str, Any],
     context_id: str | None,
     source_id: str | None,
+    event_code_override: Any = None,
 ) -> ResolvedExtractSpec:
     """Validate mapping requirements and derive routing-related metadata.
 
@@ -436,7 +454,9 @@ def _normalize_mapping(
 
     - mapping must define a non-empty `fields` object
     - a mapping to `@timestamp` must exist (with fallback injection to `ts`)
-    - a mapping to `event.code` must exist
+        - a mapping to `event.code` must exist unless either:
+            - selected mapping defines `event_code`
+            - explicit `mapping_parameters.event_code` override is provided
     - when CLI overrides are absent, mapping must provide
       `is_gulp_type=context_name` and `is_gulp_type=source_name`
 
@@ -445,6 +465,7 @@ def _normalize_mapping(
         mapping: Mapping dictionary as produced by gULP model dump.
         context_id: Optional explicit context override from CLI.
         source_id: Optional explicit source override from CLI.
+        event_code_override: Optional top-level mapping_parameters override.
 
     Returns:
         Normalized specification with precomputed field metadata.
@@ -501,7 +522,12 @@ def _normalize_mapping(
 
     if not timestamp_fields:
         raise ValueError(f"mapping '{mapping_id}' is missing @timestamp mapping")
-    if not event_code_fields:
+    mapping_event_code = mapping.get("event_code")
+    if (
+        not event_code_fields
+        and mapping_event_code is None
+        and event_code_override is None
+    ):
         raise ValueError(f"mapping '{mapping_id}' is missing event.code mapping")
 
     if context_id is None and not context_name_fields:
@@ -562,12 +588,17 @@ async def resolve_specs(
         # mapping file inputs resolve with identical rules.
         mapping_parameters = GulpMappingParameters.model_validate(mp_dict)
         resolved_mappings, mapping_id = await mapping_parameters_to_mapping(
-            mapping_parameters
+            mapping_parameters,
+            mapping_base_path=cfg.mapping_files_base_path,
         )
         mapping = resolved_mappings[mapping_id].model_dump()
 
         normalized = _normalize_mapping(
-            mapping_id, mapping, cfg.context_id, cfg.source_id
+            mapping_id,
+            mapping,
+            cfg.context_id,
+            cfg.source_id,
+            event_code_override=mp_dict.get("event_code"),
         )
         normalized.plugin = str(plugin)
         normalized.mapping_parameters = deepcopy(mp_dict)
@@ -613,6 +644,8 @@ def _should_preserve_source_field(mapping: dict[str, Any], source_field: str) ->
     mapped_fields = mapping.get("fields") or {}
 
     if not _should_process_source_field(mapping, source_field):
+        return False
+    if source_field == "gulp" or source_field.startswith("gulp."):
         return False
     if source_field in opensearch_metadata_fields:
         return False
@@ -683,6 +716,7 @@ async def map_record_to_gulp_document(
     - coerce/transform values according to mapping directives
     - normalize timestamp output
     - apply value aliases
+    - apply `mapping_parameters`-level overrides (`agent_type`, `event_code`)
     - resolve/assign `gulp.context_id` and `gulp.source_id`
 
     Args:
@@ -702,21 +736,38 @@ async def map_record_to_gulp_document(
     """
 
     fields = spec.mapping.get("fields", {})
+    agent_type_override = spec.mapping_parameters.get("agent_type")
+    event_code_override = spec.mapping_parameters.get("event_code")
+
+    if agent_type_override is not None:
+        agent_type_override = str(agent_type_override)
+    if event_code_override is not None:
+        event_code_override = str(event_code_override)
+
+    # Sanitize extraction-only fields before any preservation or serialization.
+    # Keep this list narrow and explicit to avoid surprising data loss.
+    sanitized_record = deepcopy(raw_record)
+    sanitized_record.pop("_generated", None)
+    for key in list(sanitized_record.keys()):
+        if key == "gulp" or key.startswith("gulp."):
+            sanitized_record.pop(key, None)
+
     # Preserve unmapped original fields while still filtering source metadata and
     # respecting include/exclude rules. This keeps event.original informative.
     mapped: dict[str, Any] = {
         key: deepcopy(value)
-        for key, value in raw_record.items()
+        for key, value in sanitized_record.items()
         if _should_preserve_source_field(spec.mapping, key)
     }
 
-    # Remove extraction-only metadata from the canonical event.original payload.
-    raw_record.pop("_generated", None)
+    # Store the sanitized source payload in event.original.
     mapped.update(
         {
-            "event.original": json.dumps(raw_record, sort_keys=True, default=str),
+            "event.original": json.dumps(sanitized_record, sort_keys=True, default=str),
             "event.sequence": event_sequence,
-            "agent.type": spec.mapping.get("agent_type") or spec.plugin,
+            "agent.type": agent_type_override
+            or spec.mapping.get("agent_type")
+            or spec.plugin,
         }
     )
 
@@ -728,13 +779,13 @@ async def map_record_to_gulp_document(
 
     for source_field, field_mapping in fields.items():
         if (
-            source_field not in raw_record
+            source_field not in sanitized_record
             or not isinstance(field_mapping, dict)
             or not _should_process_source_field(spec.mapping, source_field)
         ):
             continue
 
-        raw_value = raw_record[source_field]
+        raw_value = sanitized_record[source_field]
         if raw_value is None:
             continue
 
@@ -783,7 +834,11 @@ async def map_record_to_gulp_document(
     if "@timestamp" not in mapped:
         raise ValueError(f"record missing mapped @timestamp for plugin '{spec.plugin}'")
 
-    event_code = mapped.get("event.code") or spec.mapping.get("event_code")
+    event_code = (
+        event_code_override
+        or mapped.get("event.code")
+        or spec.mapping.get("event_code")
+    )
     if event_code is None:
         raise ValueError(f"record missing mapped event.code for plugin '{spec.plugin}'")
     mapped["event.code"] = str(event_code)
