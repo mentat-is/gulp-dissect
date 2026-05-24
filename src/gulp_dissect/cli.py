@@ -4,13 +4,10 @@ This module implements the full `gulp-dissect` runtime pipeline:
 
 1. Parse CLI arguments and construct a validated runtime configuration.
 2. Resolve one or more extract tuple specifications (`plugin`, `mapping_parameters`)
-     using gULP's own mapping-resolution utilities.
+    using gULP's own mapping-resolution utilities.
 3. Open a Dissect target image and stream records for each requested plugin.
-4. Transform each Dissect record into a gULP-compatible raw document by applying
-     mapping rules, timestamp normalization, type coercion, ECS projection, and
-     context/source resolution.
-5. Optionally filter mapped documents client-side via `GulpIngestionFilter`.
-6. Send accepted documents to `/ingest_raw` in bounded chunks.
+4. Optionally filter raw extracted records client-side via `GulpIngestionFilter`.
+5. Send accepted documents to `/ingest_raw` in bounded chunks.
 
 Design notes:
 
@@ -43,16 +40,8 @@ from dissect.target.tools.utils.cli import execute_function_on_target
 from muty.log import MutyLogger
 import muty.time
 from gulp.api.mapping.mapping_utils import (
-    apply_value_aliases,
-    build_extra_doc_fields,
-    build_gulp_document_id,
-    convert_special_timestamp,
-    expand_extra_docs,
-    flatten_json_value,
-    mapping_attr,
     mapping_parameters_to_mapping,
     normalize_timestamp,
-    transform_scalar,
 )
 from gulp.api.opensearch.filters import GulpIngestionFilter
 from gulp_sdk import GulpClient
@@ -110,21 +99,10 @@ class AppConfig:
 
 @dataclass
 class ResolvedExtractSpec:
-    """Validated extract tuple used by the extraction/ingestion loop.
-
-    A `ResolvedExtractSpec` is produced from user-provided tuple inputs after
-    mapping resolution and static validation. Precomputed field lists are stored
-    for downstream logic and diagnostics.
-    """
+    """Validated extract tuple used by the extraction/ingestion loop."""
 
     plugin: str
     mapping_id: str
-    mapping: dict[str, Any]
-    timestamp_fields: list[str]
-    timestamp_formats: dict[str, str | None]
-    event_code_fields: list[str]
-    context_name_fields: list[str]
-    source_name_fields: list[str]
     mapping_parameters: dict[str, Any] = field(default_factory=dict)
 
 
@@ -454,148 +432,63 @@ def collect_extract_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
     return specs
 
 
-def _ecs_contains(field_mapping: dict[str, Any], ecs_name: str) -> bool:
-    """Return whether a mapping field routes to the requested ECS destination.
+def _resolve_mapping_path(path: str, base_path: str | None) -> str:
+    """Resolve one mapping file path against the optional base path."""
 
-    The `ecs` attribute can be either a single string or a list of strings.
-    """
-    ecs = field_mapping.get("ecs")
-    if isinstance(ecs, str):
-        return ecs == ecs_name
-    if isinstance(ecs, list):
-        return ecs_name in ecs
-    return False
+    if not path or not base_path or os.path.isabs(path):
+        return path
+
+    resolved = str((Path(base_path) / path).resolve())
+    if not Path(resolved).exists():
+        raise FileNotFoundError(f"mapping file {resolved} does not exist")
+    return resolved
 
 
-def _normalize_mapping(
-    mapping_id: str,
-    mapping: dict[str, Any],
-    context_name: str | None,
-    source_name: str | None,
-    event_code_override: Any = None,
-) -> ResolvedExtractSpec:
-    """Validate mapping requirements and derive routing-related metadata.
+async def _normalize_mapping_parameters(
+    mp_dict: dict[str, Any],
+    mapping_files_base_path: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Validate mapping parameters and inline any file-based mappings."""
 
-    Validation rules enforced here are runtime-critical and intentionally strict:
+    mapping_parameters = GulpMappingParameters.model_validate(mp_dict)
 
-    - mapping must define a non-empty `fields` object
-    - a mapping to `@timestamp` must exist (with fallback injection to `ts`)
-        - a mapping to `event.code` must exist unless either:
-            - selected mapping defines `event_code`
-            - explicit `mapping_parameters.event_code` override is provided
-    - when CLI overrides are absent, mapping must provide
-      `is_gulp_type=context_name` and `is_gulp_type=source_name`
-
-    Args:
-        mapping_id: Mapping identifier selected from resolved mappings.
-        mapping: Mapping dictionary as produced by gULP model dump.
-        context_name: Optional explicit context name override from CLI.
-        source_name: Optional explicit source name override from CLI.
-        event_code_override: Optional top-level mapping_parameters override.
-
-    Returns:
-        Normalized specification with precomputed field metadata.
-
-    Raises:
-        ValueError: If mapping structure or required semantic contracts are
-            invalid.
-    """
-
-    fields = mapping.get("fields")
-    if not isinstance(fields, dict) or not fields:
-        raise ValueError(
-            f"mapping '{mapping_id}' must contain a non-empty fields object"
+    if mapping_parameters.mapping_file:
+        mapping_parameters.mapping_file = _resolve_mapping_path(
+            mapping_parameters.mapping_file,
+            mapping_files_base_path,
         )
 
-    timestamp_fields: list[str] = []
-    timestamp_formats: dict[str, str | None] = {}
-    event_code_fields: list[str] = []
-    context_name_fields: list[str] = []
-    source_name_fields: list[str] = []
+    if mapping_parameters.additional_mapping_files:
+        mapping_parameters.additional_mapping_files = [
+            (
+                _resolve_mapping_path(file_path, mapping_files_base_path),
+                mapping_id,
+            )
+            for file_path, mapping_id in mapping_parameters.additional_mapping_files
+        ]
 
-    for source_field, raw_field_mapping in fields.items():
-        if not isinstance(raw_field_mapping, dict):
-            continue
-        if _ecs_contains(raw_field_mapping, "@timestamp"):
-            timestamp_fields.append(source_field)
-            timestamp_formats[source_field] = raw_field_mapping.get("timestamp_format")
-        if _ecs_contains(raw_field_mapping, "event.code"):
-            event_code_fields.append(source_field)
-        field_type = raw_field_mapping.get("is_gulp_type")
-        if field_type == "context_name":
-            context_name_fields.append(source_field)
-        if field_type == "source_name":
-            source_name_fields.append(source_field)
-
-    if not timestamp_fields:
-        # default mapping of @timestamp to "ts" if no other timestamp mapping is provided
-        ts_mapping = fields.setdefault("ts", {})
-        if not isinstance(ts_mapping, dict):
-            ts_mapping = {}
-            fields["ts"] = ts_mapping
-
-        ecs = ts_mapping.get("ecs")
-        if ecs is None:
-            ts_mapping["ecs"] = ["@timestamp"]
-        elif isinstance(ecs, str):
-            if ecs != "@timestamp":
-                ts_mapping["ecs"] = [ecs, "@timestamp"]
-        elif isinstance(ecs, list) and "@timestamp" not in ecs:
-            ecs.append("@timestamp")
-
-        timestamp_fields.append("ts")
-        timestamp_formats["ts"] = ts_mapping.get("timestamp_format")
-
-    if not timestamp_fields:
-        raise ValueError(f"mapping '{mapping_id}' is missing @timestamp mapping")
-    mapping_event_code = mapping.get("event_code")
-    if (
-        not event_code_fields
-        and mapping_event_code is None
-        and event_code_override is None
-    ):
-        raise ValueError(f"mapping '{mapping_id}' is missing event.code mapping")
-
-    if context_name is None and not context_name_fields:
-        raise ValueError(
-            f"mapping '{mapping_id}' must define a field with is_gulp_type='context_name' when --context_name is not provided"
+    if mapping_parameters.mapping_file:
+        resolved_mappings, mapping_id = await mapping_parameters_to_mapping(
+            mapping_parameters,
         )
-    if source_name is None and not source_name_fields:
-        raise ValueError(
-            f"mapping '{mapping_id}' must define a field with is_gulp_type='source_name' when --source_name is not provided"
+        mapping_parameters.mappings = resolved_mappings
+        mapping_parameters.mapping_id = mapping_id
+        mapping_parameters.mapping_file = None
+        mapping_parameters.additional_mapping_files = []
+        mapping_parameters.additional_mappings = {}
+    else:
+        mapping_id = mapping_parameters.mapping_id or next(
+            iter(mapping_parameters.mappings.keys()),
+            "default",
         )
 
-    return ResolvedExtractSpec(
-        plugin="",
-        mapping_id=mapping_id,
-        mapping=mapping,
-        timestamp_fields=timestamp_fields,
-        timestamp_formats=timestamp_formats,
-        event_code_fields=event_code_fields,
-        context_name_fields=context_name_fields,
-        source_name_fields=source_name_fields,
-    )
+    return mapping_parameters.model_dump(exclude_none=True), str(mapping_id)
 
 
 async def resolve_specs(
     specs_raw: list[dict[str, Any]], cfg: AppConfig
 ) -> list[ResolvedExtractSpec]:
-    """Resolve user tuple inputs into validated, normalized extract specs.
-
-    Mapping resolution is delegated to gULP's
-    `mapping_parameters_to_mapping` helper to guarantee parity with backend
-    behavior for inline mappings, mapping files, and additional mapping imports.
-
-    Args:
-        specs_raw: Raw tuple dictionaries collected from CLI/file inputs.
-        cfg: Runtime configuration, used for context/source validation rules.
-
-    Returns:
-        List of validated :class:`ResolvedExtractSpec` entries.
-
-    Raises:
-        ValueError: If tuple format, plugin, or mapping payloads are invalid.
-    """
+    """Validate extract specs and normalize mapping parameter file paths."""
     resolved: list[ResolvedExtractSpec] = []
     for idx, spec in enumerate(specs_raw, start=1):
         if not isinstance(spec, dict):
@@ -610,362 +503,19 @@ async def resolve_specs(
                 f"extract spec #{idx} is missing mapping_parameters object"
             )
 
-        # Parse mappings using the same helper as gULP so inline mappings and
-        # mapping file inputs resolve with identical rules.
-        mapping_parameters = GulpMappingParameters.model_validate(mp_dict)
-        resolved_mappings, mapping_id = await mapping_parameters_to_mapping(
-            mapping_parameters,
-            mapping_base_path=cfg.mapping_files_base_path,
+        normalized_mapping_parameters, mapping_id = await _normalize_mapping_parameters(
+            mp_dict,
+            cfg.mapping_files_base_path,
         )
-        mapping = resolved_mappings[mapping_id].model_dump()
-
-        normalized = _normalize_mapping(
-            mapping_id,
-            mapping,
-            cfg.context_name,
-            cfg.source_name,
-            event_code_override=mp_dict.get("event_code"),
+        resolved.append(
+            ResolvedExtractSpec(
+                plugin=str(plugin),
+                mapping_id=mapping_id,
+                mapping_parameters=normalized_mapping_parameters,
+            )
         )
-        normalized.plugin = str(plugin)
-        normalized.mapping_parameters = deepcopy(mp_dict)
-        resolved.append(normalized)
 
     return resolved
-
-
-def _should_process_source_field(mapping: dict[str, Any], source_field: str) -> bool:
-    """Apply mapping include/exclude constraints to one source field name."""
-
-    include_fields = mapping.get("include") or []
-    exclude_fields = mapping.get("exclude") or []
-
-    if include_fields and source_field not in include_fields:
-        return False
-    if source_field in exclude_fields:
-        return False
-    return True
-
-
-def _should_preserve_source_field(mapping: dict[str, Any], source_field: str) -> bool:
-    """Decide whether an original source field should be preserved in output.
-
-    Preservation is intended for unmapped payload context while avoiding:
-
-    - OpenSearch metadata keys
-    - fields explicitly mapped to ECS/gULP targets
-    - fields removed by include/exclude constraints
-    """
-
-    opensearch_metadata_fields = {
-        "_id",
-        "_ignored",
-        "_index",
-        "_primary_term",
-        "_routing",
-        "_seq_no",
-        "_source",
-        "_type",
-        "_version",
-    }
-    mapped_fields = mapping.get("fields") or {}
-
-    if not _should_process_source_field(mapping, source_field):
-        return False
-    if source_field == "gulp" or source_field.startswith("gulp."):
-        return False
-    if source_field in opensearch_metadata_fields:
-        return False
-    if source_field in mapped_fields:
-        return False
-    return True
-
-
-async def _ensure_context_id(
-    client: GulpClient,
-    operation_id: str,
-    context_name: str,
-    cache: dict[str, str],
-) -> str:
-    """Resolve a context id from context name with in-run memoization.
-
-    Context creation in gULP is idempotent for existing names under operation,
-    but memoization avoids duplicate API calls during large ingest loops.
-    """
-
-    if context_name in cache:
-        return cache[context_name]
-    context = await client.operations.context_create(operation_id, context_name)
-    context_id = str(context["id"])
-    cache[context_name] = context_id
-    return context_id
-
-
-async def _ensure_source_id(
-    client: GulpClient,
-    operation_id: str,
-    context_id: str,
-    source_name: str,
-    cache: dict[tuple[str, str], str],
-) -> str:
-    """Resolve a source id from source name with per-context memoization."""
-
-    key = (context_id, source_name)
-    if key in cache:
-        return cache[key]
-    source = await client.operations.source_create(
-        operation_id=operation_id,
-        context_id=context_id,
-        source_name=source_name,
-        plugin="raw",
-    )
-    source_id = str(source["id"])
-    cache[key] = source_id
-    return source_id
-
-
-async def map_record_to_gulp_documents(
-    client: GulpClient,
-    cfg: AppConfig,
-    spec: ResolvedExtractSpec,
-    raw_record: dict[str, Any],
-    event_sequence: int,
-    context_cache: dict[str, str],
-    source_cache: dict[tuple[str, str], str],
-) -> list[dict[str, Any]]:
-    """Map one Dissect record into one or more gULP raw document payloads.
-
-    This performs all per-record transformations required for ingest compatibility:
-
-    - preserve selected unmapped fields
-    - generate `event.original` and `event.sequence`
-    - map source fields to ECS targets
-    - coerce/transform values according to mapping directives
-    - normalize timestamp output
-    - apply value aliases
-    - apply `mapping_parameters`-level overrides (`agent_type`, `event_code`)
-    - resolve/assign `gulp.context_id` and `gulp.source_id`
-
-    Args:
-        client: Active gULP client used for context/source resolution.
-        cfg: Runtime configuration.
-        spec: Validated mapping specification for this plugin stream.
-        raw_record: Source Dissect record as plain dictionary.
-        event_sequence: Sequence value assigned to `event.sequence`.
-        context_cache: In-memory cache for context id lookups.
-        source_cache: In-memory cache for source id lookups.
-
-    Returns:
-        JSON-serializable mapped document dictionaries.
-
-    Raises:
-        ValueError: If required mapped values cannot be resolved.
-    """
-
-    fields = spec.mapping.get("fields", {})
-    agent_type_override = spec.mapping_parameters.get("agent_type")
-    event_code_override = spec.mapping_parameters.get("event_code")
-
-    if agent_type_override is not None:
-        agent_type_override = str(agent_type_override)
-    if event_code_override is not None:
-        event_code_override = str(event_code_override)
-
-    # Sanitize extraction-only fields before any preservation or serialization.
-    # Keep this list narrow and explicit to avoid surprising data loss.
-    sanitized_record = deepcopy(raw_record)
-    sanitized_record.pop("_generated", None)
-    for key in list(sanitized_record.keys()):
-        if key == "gulp" or key.startswith("gulp."):
-            sanitized_record.pop(key, None)
-
-    # Preserve unmapped original fields while still filtering source metadata and
-    # respecting include/exclude rules. This keeps event.original informative.
-    mapped: dict[str, Any] = {
-        key: deepcopy(value)
-        for key, value in sanitized_record.items()
-        if _should_preserve_source_field(spec.mapping, key)
-    }
-
-    # Store the sanitized source payload in event.original.
-    mapped.update(
-        {
-            "event.original": json.dumps(sanitized_record, sort_keys=True, default=str),
-            "event.sequence": event_sequence,
-            "agent.type": agent_type_override
-            or spec.mapping.get("agent_type")
-            or spec.plugin,
-        }
-    )
-
-    explicit_context_name = cfg.context_name
-    explicit_source_name = cfg.source_name
-    context_locked = explicit_context_name is not None
-    source_locked = explicit_source_name is not None
-
-    context_id: str | None = None
-    source_id: str | None = None
-    context_name = (
-        explicit_context_name if context_locked else spec.mapping.get("default_context")
-    )
-    source_name = (
-        explicit_source_name if source_locked else spec.mapping.get("default_source")
-    )
-    value_aliases = spec.mapping.get("value_aliases") or {}
-    extra_docs: list[dict[str, Any]] = []
-
-    for source_field, field_mapping in fields.items():
-        if (
-            source_field not in sanitized_record
-            or not isinstance(field_mapping, dict)
-            or not _should_process_source_field(spec.mapping, source_field)
-        ):
-            continue
-
-        raw_value = sanitized_record[source_field]
-        if raw_value is None:
-            continue
-
-        gulp_type = field_mapping.get("is_gulp_type")
-        transformed = transform_scalar(
-            raw_value,
-            force_type=mapping_attr(field_mapping, "force_type"),
-            multiplier=mapping_attr(field_mapping, "multiplier"),
-        )
-
-        if mapping_attr(field_mapping, "flatten_json"):
-            mapped.update(flatten_json_value(transformed))
-
-        extra_doc_timestamp: str | None = None
-        if mapping_attr(field_mapping, "extra_doc_with_event_code"):
-            extra_doc_timestamp = convert_special_timestamp(
-                raw_value,
-                timestamp_kind=mapping_attr(field_mapping, "is_timestamp") or "generic",
-                timestamp_format=mapping_attr(field_mapping, "timestamp_format"),
-                output="iso8601",
-            )
-
-        if gulp_type == "context_id" and not context_locked and context_id is None:
-            context_id = str(transformed)
-        elif gulp_type == "context_name" and not context_locked and context_id is None:
-            context_name = str(transformed)
-        elif gulp_type == "source_id" and not source_locked and source_id is None:
-            source_id = str(transformed)
-        elif gulp_type == "source_name" and not source_locked and source_id is None:
-            source_name = str(transformed)
-
-        ecs_targets = field_mapping.get("ecs")
-        if isinstance(ecs_targets, str):
-            ecs_targets = [ecs_targets]
-        mapped_fields_for_extra: list[str] = []
-        if not ecs_targets:
-            if extra_doc_timestamp is not None:
-                extra_docs.append(
-                    build_extra_doc_fields(
-                        field_mapping,
-                        timestamp_value=extra_doc_timestamp,
-                        event_code_field="event.code",
-                        timestamp_field="@timestamp",
-                    )
-                )
-            continue
-
-        for ecs_field in ecs_targets:
-            if ecs_field == "@timestamp":
-                mapped[ecs_field] = convert_special_timestamp(
-                    raw_value,
-                    timestamp_kind=mapping_attr(field_mapping, "is_timestamp"),
-                    timestamp_format=mapping_attr(field_mapping, "timestamp_format"),
-                    output="iso8601",
-                )
-            else:
-                mapped[ecs_field] = transformed
-
-            # Apply aliases to each mapped ECS field using the same helper as gULP.
-            if value_aliases:
-                alias_target = {ecs_field: mapped[ecs_field]}
-                apply_value_aliases(ecs_field, alias_target, value_aliases)
-                mapped[ecs_field] = alias_target[ecs_field]
-            mapped_fields_for_extra.append(ecs_field)
-
-        if extra_doc_timestamp is not None:
-            extra_docs.append(
-                build_extra_doc_fields(
-                    field_mapping,
-                    timestamp_value=extra_doc_timestamp,
-                    mapped_fields=mapped_fields_for_extra,
-                    event_code_field="event.code",
-                    timestamp_field="@timestamp",
-                )
-            )
-
-    if "@timestamp" not in mapped:
-        raise ValueError(f"record missing mapped @timestamp for plugin '{spec.plugin}'")
-
-    event_code = (
-        event_code_override
-        or mapped.get("event.code")
-        or spec.mapping.get("event_code")
-    )
-    if event_code is None:
-        raise ValueError(f"record missing mapped event.code for plugin '{spec.plugin}'")
-    mapped["event.code"] = str(event_code)
-
-    if context_id is None:
-        if context_name is None:
-            raise ValueError(
-                "Unable to resolve gulp.context_id: missing context_id and context_name"
-            )
-        context_id = await _ensure_context_id(
-            client, cfg.operation_id, context_name, context_cache
-        )
-
-    if source_id is None:
-        if source_name is None:
-            raise ValueError(
-                "Unable to resolve gulp.source_id: missing source_id and source_name"
-            )
-        source_id = await _ensure_source_id(
-            client, cfg.operation_id, context_id, source_name, source_cache
-        )
-
-    mapped["gulp.context_id"] = context_id
-    mapped["gulp.source_id"] = source_id
-
-    base_document_id = build_gulp_document_id(
-        event_original=str(mapped["event.original"]),
-        event_code=str(mapped["event.code"]),
-        operation_id=cfg.operation_id,
-        context_id=str(mapped["gulp.context_id"]),
-        source_id=str(mapped["gulp.source_id"]),
-        event_sequence=int(mapped.get("event.sequence", 0)),
-        timestamp=str(mapped["@timestamp"]),
-    )
-    mapped["_id"] = base_document_id
-
-    return expand_extra_docs(mapped, extra_docs, base_document_id=base_document_id)
-
-
-async def map_record_to_gulp_document(
-    client: GulpClient,
-    cfg: AppConfig,
-    spec: ResolvedExtractSpec,
-    raw_record: dict[str, Any],
-    event_sequence: int,
-    context_cache: dict[str, str],
-    source_cache: dict[tuple[str, str], str],
-) -> dict[str, Any]:
-    """Compatibility wrapper returning the primary mapped document only."""
-
-    documents = await map_record_to_gulp_documents(
-        client,
-        cfg,
-        spec,
-        raw_record,
-        event_sequence,
-        context_cache,
-        source_cache,
-    )
-    return documents[0]
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -1011,25 +561,25 @@ def record_to_dict(record: Any) -> dict[str, Any]:
 
 
 def _passes_ingestion_filter(
-    mapped_record: dict[str, Any],
+    raw_record: dict[str, Any],
     flt: GulpIngestionFilter | None,
 ) -> bool:
-    """Evaluate one mapped record against client-side ingestion filtering rules.
+    """Evaluate one raw extracted record against local ingestion filtering rules.
 
     Filter contract:
 
     - if no filter is provided, every document is accepted
     - if `storage_ignore_filter` is true, every document is accepted
     - all configured conditions are combined as logical AND
-    - `time_range` is applied to `gulp.timestamp` when present, otherwise to a
-      converted `@timestamp`
+        - `time_range` is applied to the first available raw timestamp candidate in
+            this order: `gulp.timestamp`, `@timestamp`, `ts`
     - extra filter keys (`model_extra`) support:
       - string equality: `{ "field": "value" }`
       - numeric equality: `{ "field": 42 }`
       - numeric range: `{ "field": {"gte": 10, "lte": 20} }`
 
     Args:
-        mapped_record: Fully mapped document candidate.
+        raw_record: Extracted record candidate before backend mapping.
         flt: Optional parsed ingestion filter.
 
     Returns:
@@ -1048,24 +598,37 @@ def _passes_ingestion_filter(
         if _is_number(condition):
             return _is_number(value) and value == condition
 
-        # number comparison with explicit operators
+        # ordered comparison with explicit operators
         if isinstance(condition, dict):
-            if not _is_number(value):
-                return False
-
             allowed = {"gte", "lte"}
             if not condition or any(k not in allowed for k in condition):
                 return False
 
-            for op, op_value in condition.items():
-                if not _is_number(op_value):
-                    return False
-                if op == "gte" and value < op_value:
-                    return False
-                if op == "lte" and value > op_value:
-                    return False
+            # numeric ordered comparison
+            if _is_number(value):
+                for op, op_value in condition.items():
+                    if not _is_number(op_value):
+                        return False
+                    if op == "gte" and value < op_value:
+                        return False
+                    if op == "lte" and value > op_value:
+                        return False
 
-            return True
+                return True
+
+            # string ordered comparison (lexicographic), useful for ISO8601 dates
+            if isinstance(value, str):
+                for op, op_value in condition.items():
+                    if not isinstance(op_value, str):
+                        return False
+                    if op == "gte" and value < op_value:
+                        return False
+                    if op == "lte" and value > op_value:
+                        return False
+
+                return True
+
+            return False
 
         return False
 
@@ -1074,16 +637,24 @@ def _passes_ingestion_filter(
 
     # 1) apply time_range when present
     if flt.time_range and len(flt.time_range) == 2:
+        # turn start/end/ into nanoseconds
         start, end = flt.time_range
+        if isinstance(start, str) and not start.isnumeric():
+            start = muty.time.string_to_nanos_from_unix_epoch(start)
+        if isinstance(end, str) and not end.isnumeric():
+            end = muty.time.string_to_nanos_from_unix_epoch(end)
+
+        ts_nanos: int = None
         if not (start == 0 and end == 0):
-            ts_nanos = mapped_record.get("gulp.timestamp")
-            if not isinstance(ts_nanos, int):
+            timestamp = raw_record.get("ts")
+            if timestamp:
                 try:
                     ts_nanos = muty.time.string_to_nanos_from_unix_epoch(
-                        mapped_record.get("@timestamp"),
+                        timestamp,
                         throw_on_invalid=True,
                     )
-                except Exception:
+                    # print(f"normalized timestamp 'ts' in nanos: {ts_nanos}")
+                except Exception as ex:
                     ts_nanos = None
             if ts_nanos is not None:
                 if start > 0 and ts_nanos < start:
@@ -1094,9 +665,9 @@ def _passes_ingestion_filter(
     # 2) apply extra field filters from model_extra
     extras = flt.model_extra or {}
     for field_name, condition in extras.items():
-        if field_name not in mapped_record:
+        if field_name not in raw_record:
             return False
-        if not _matches_model_extra(mapped_record[field_name], condition):
+        if not _matches_model_extra(raw_record[field_name], condition):
             return False
 
     return True
@@ -1153,20 +724,20 @@ async def ingest_spec(
     spec: ResolvedExtractSpec,
     max_records: int | None = None,
 ) -> int:
-    """Extract, transform, filter, and ingest records for a single spec.
+    """Extract raw records and ingest them for a single spec.
 
     Processing order:
 
     1. iterate Dissect records for selected plugin
-    2. map each record into gULP raw-document shape
-    3. apply optional client-side ingestion filter
-    4. append accepted documents to chunk buffer
+    2. optionally pre-map records locally for client-side filtering decisions
+    3. inject optional CLI context/source overrides into each raw record
+    4. append accepted records to chunk buffer
     5. flush chunks to `/ingest_raw` using a shared request id
 
     Limit semantics:
 
-    - `max_records` is applied to accepted records only
-    - filtered-out records do not count toward the limit
+        - `max_records` is applied to records accepted by local filtering and
+            submitted by this client
 
     Args:
         client: Active gULP client.
@@ -1184,10 +755,8 @@ async def ingest_spec(
 
     req_id = str(uuid.uuid4())
     chunk: list[dict[str, Any]] = []
-    total = 0
     accepted_total = 0
-    context_cache: dict[str, str] = {}
-    source_cache: dict[tuple[str, str], str] = {}
+    total = 0
     progress = None if cfg.verbose else _make_progress_bar(spec)
 
     async def _flush(last: bool) -> None:
@@ -1221,34 +790,25 @@ async def ingest_spec(
                 break
 
             total += 1
-            mapped_records = await map_record_to_gulp_documents(
-                client,
-                cfg,
-                spec,
-                raw_record,
-                total,
-                context_cache,
-                source_cache,
-            )
+            to_send = deepcopy(raw_record)
+            if cfg.context_name is not None:
+                to_send["gulp.context_id"] = str(cfg.context_name)
+            if cfg.source_name is not None:
+                to_send["gulp.source_id"] = str(cfg.source_name)
 
-            for mapped_record in mapped_records:
-                if max_records is not None and accepted_total >= max_records:
-                    break
-
-                if not _passes_ingestion_filter(mapped_record, cfg.flt):
+            if cfg.flt is not None:
+                if not _passes_ingestion_filter(to_send, cfg.flt):
                     continue
 
-                accepted_total += 1
-                if cfg.verbose:
-                    print(json.dumps(mapped_record, sort_keys=True, default=str))
-                elif progress is not None:
-                    progress.update(1)
-                chunk.append(mapped_record)
-                if len(chunk) >= cfg.chunk_size:
-                    await _flush(last=False)
+            accepted_total += 1
+            if cfg.verbose:
+                print(json.dumps(to_send, sort_keys=True, default=str))
+            elif progress is not None:
+                progress.update(1)
 
-            if max_records is not None and accepted_total >= max_records:
-                break
+            chunk.append(to_send)
+            if len(chunk) >= cfg.chunk_size:
+                await _flush(last=False)
 
         if chunk:
             await _flush(last=True)

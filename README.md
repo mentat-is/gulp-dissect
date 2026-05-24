@@ -1,12 +1,12 @@
 - [gulp-dissect](#gulp-dissect)
   - [Install](#install)
   - [CLI](#cli)
-    - [set dissect plugin/s and provide mappings](#set-dissect-plugins-and-provide-mappings)
+    - [configure the dissect plugin/s to use and provide mappings for gulp](#configure-the-dissect-plugins-to-use-and-provide-mappings-for-gulp)
       - [tuples input on the command line](#tuples-input-on-the-command-line)
       - [tuples input from a JSON file](#tuples-input-from-a-json-file)
-  - [Filtering with --flt](#filtering-with---flt)
-  - [Required Mapping Validation](#required-mapping-validation)
-  - [Notes](#notes)
+  - [examples](#examples)
+    - [filtering](#filtering)
+  - [Mapping Behavior](#mapping-behavior)
 
 # gulp-dissect
 
@@ -87,13 +87,9 @@ All other options are command-line only.
 
 When `--context_name` and/or `--source_name` are provided, each value is treated as a context/source name override: gULP resolves it via `context_create` / `source_create` (creating it if missing), and the resulting ids are used in generated documents.
 
-### set dissect plugin/s and provide mappings
+### configure the dissect plugin/s to use and provide mappings for gulp
 
 `mapping_parameters` and related mapping format follows the same format as in [gulp](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-101) and are parsed using imported gulp's code.
-
-the only difference is not all flags are supported. specifically:
-
-> 1. `is_gulp_type` is supported only for `context_name` and `source_name` to allow auto-assigning `gulp.context_id` and `gulp.source_id` respectively when the corresponding CLI flags are not provided.
 
 `--plugin` and `--mapping_parameters` must be provided using one of these forms:
 
@@ -147,66 +143,84 @@ gulp-dissect \
 - `{ "mapping_file": "/path/to/file.json", "mapping_id": "..." }`
 - `{ "mappings": { "id": { ...GulpMapping... } }, "mapping_id": "id" }`
 
-## Filtering with --flt
+> if multiple mappings are present (i.e. multiple `mappings` keys in both `--mapping_parameters.mappings` or `--mapping_parameters.mapping_file`), they are merged together and sent to backend as a single object with multiple mapping ids: thus, the desired `mapping_id` to be applied must be specified to, or gulp will use the first mapping id it finds in the merged mapping object, which may not be the intended one.
 
-`--flt` is evaluated locally by `gulp-dissect` before documents are sent to ingest.
+## examples
+
+applying value aliases
+
+~~~bash
+gulp-dissect \
+--image_path /gulp/img/SCHARDT.img \
+--username admin --password admin \
+--gulp_url http://localhost:8080 \
+--operation_id test_operation \
+--plugin evt \
+--mapping_parameters '{"mappings":{"dissect_evt":{"value_aliases":{"event.code":{"default":{"1000":"bingo"}}},"fields":{"ts":{"ecs":["@timestamp"]},"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"}}}},"mapping_id":"dissect_evt"}' --limit 2 --reset-operation
+~~~
+
+### filtering
+
+`--flt` is evaluated locally by `gulp-dissect` on **raw extracted records** before they are sent to backend **where the mapping is effectively applied**.
+
+> so you have to use raw field names and values in the filter conditions, not gulp-mapped field names or values !!!
 
 - all configured conditions are combined as AND.
+- field matches are evaluated against the raw extracted record keys, not against mapped ECS fields.
+- backend mapping still happens afterwards in gULP via `plugin_params.mapping_parameters`.
 
-Supported `model_extra` comparisons:
+Supported comparisons:
 
 - string equality: `{"key": "value"}`
+- string ranges (lexicographic, useful for ISO8601): `{"key": {"gte": "2024-01-01T00:00:00Z", "lte": "2024-01-31T23:59:59Z"}}`
 - numeric equality: `{"key": 42}`
 - numeric ranges: `{"key": {"gte": 10, "lte": 20}}`
 - numeric lower bound only: `{"key": {"gte": 10}}`
 - numeric upper bound only: `{"key": {"lte": 20}}`
+- time range on the default timestamp key "ts": `{"time_range": ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"]}` (evaluated against the raw "ts" field in extracted records, which is expected to be in ISO8601 format)
 
-Examples:
+Some examples follow.
 
-Filter by aliased event code value:
+Filter by raw event code field value:
 
 ```bash
 gulp-dissect \
-  --image_path /gulp/img/SCHARDT.img \
-  --username admin --password admin \
-  --gulp_url http://localhost:8080 \
-  --operation_id test_operation \
-  --plugin evt \
-  --mapping_parameters '{"mappings":{"dissect_evt":{"value_aliases":{"event.code":{"default":{"1073748859":"bingo"}}},"fields":{"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"}}}},"mapping_id":"dissect_evt"}' \
-  --flt '{"event.code":"bla"}'
+--image_path /gulp/img/SCHARDT.img \
+--username admin --password admin \
+--gulp_url http://localhost:8080 \
+--operation_id test_operation \
+--plugin evt \
+--mapping_parameters '{"mappings":{"dissect_evt":{"value_aliases":{"event.code":{"default":{"1000":"bingo"}}},"fields":{"ts":{"ecs":["@timestamp"]},"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"}}}},"mapping_id":"dissect_evt"}' --flt '{"EventCode":1000}' --reset-operation
 ```
+
+> in the example above, filtering is applied locally on raw data, then value_aliases is applied by the backend. So if you want to filter by an aliased value, you need to use the original value in the filter condition, not the alias.
 
 Filter by numeric equality:
 
 ```bash
---flt '{"event.severity":3}'
+--flt '{"Severity":3}'
 ```
 
 Filter by numeric range:
 
 ```bash
---flt '{"event.severity":{"gte":3,"lte":5}}'
+--flt '{"Severity":{"gte":3,"lte":5}}'
 ```
 
-Combine time range and extra fields (AND):
+Combine time range and raw fields (AND):
 
 ```bash
---flt '{"time_range":[1704067200000000000,1704153600000000000],"event.category":"authentication","event.severity":{"gte":3}}'
+ --flt '{"time_range": ["2004-08-20T15:25:39+00:00","2004-08-20T15:45:39+00:00"],"Channel":"Security","Severity":{"gte":3}}'
 ```
 
-## Required Mapping Validation
+> `time_range` is evaluated against "ts", which is the default timestamp key used by dissect, and **must be specified as an ISO8601 string**.
 
-Before ingestion starts, each extract tuple is validated:
+## Mapping Behavior
 
-- `@timestamp` mapping is required (fallback to source field `ts` is applied only if no explicit `@timestamp` mapping exists and `ts` exists in mapping fields).
-- `event.code` mapping is required.
-- If `--context_name` is not provided, at least one mapping field must define `is_gulp_type: "context_name"`.
-- If `--source_name` is not provided, at least one mapping field must define `is_gulp_type: "source_name"`.
-- If `--context_name` and/or `--source_name` are provided, those overrides bypass mapping-based context/source extraction and are resolved/created using the provided values as names.
+mapping is performed on the backend as usual, applying the given mapping to the `raw` plugin.
 
-## Notes
+specifically:
 
-- Generated GulpDocuments preserves unmapped Dissect fields **as is**; fields referenced by the mapping are transformed into ECS / gULP targets and removed from the raw payload.
-- `--limit` applies globally across all extract specs in one run.
-- `--reset-operation` clears (recreates) the target operation before ingestion, allowing for a clean slate without needing to manually reset the gULP instance; use with caution as it deletes all existing data in the operation.
-- The tool always attempts `logout`, even when extraction or ingestion fails.
+1. any `mapping_file` or `additional_mapping_files` provided in `GulpMappingParameters` are cleared, converted to direct json mappings and set in `plugin_params.mapping_parameters.mappings` prior to sending to backend together with the provided `mapping_id`.
+2. Extracted records are sent as raw payloads to backend and handled by the `raw` plugin for ingestion.
+3. backend then applies the mapping as usual during ingestion.
