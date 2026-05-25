@@ -2,11 +2,10 @@
   - [Install](#install)
   - [CLI](#cli)
     - [configure the dissect plugin/s to use and provide mappings for gulp](#configure-the-dissect-plugins-to-use-and-provide-mappings-for-gulp)
-      - [tuples input on the command line](#tuples-input-on-the-command-line)
-      - [tuples input from a JSON file](#tuples-input-from-a-json-file)
+      - [mapping input via the command line](#mapping-input-via-the-command-line)
+      - [mapping input via a JSON file](#mapping-input-via-a-json-file)
   - [examples](#examples)
     - [filtering](#filtering)
-  - [Mapping Behavior](#mapping-behavior)
 
 # gulp-dissect
 
@@ -14,12 +13,14 @@
 
 ## Install
 
-From this repository root:
+From this repository root, in a Python 3.12+ environment:
 
 ```bash
 cd gulp-dissect
-/gulp/.venv/bin/pip install -e .
+pip install -e .
 ```
+
+> `dissect` itself seems not working with Python 3.14 at the moment, so we recommend using Python 3.13 for now until that is resolved.
 
 ## CLI
 
@@ -89,13 +90,28 @@ When `--context_name` and/or `--source_name` are provided, each value is treated
 
 ### configure the dissect plugin/s to use and provide mappings for gulp
 
-`mapping_parameters` and related mapping format follows the same format as in [gulp](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-101) and are parsed using imported gulp's code.
+`gulp-dissect` works similar as when calling the gulp ingestion API, basically it needs a `--plugin` parameter to tell which `plugin` (intended here as one of the [dissect plugins](https://docs.dissect.tools/en/stable/plugins/index.html)) to use for extraction, and a `--mapping_parameters` parameter to provide the corresponding mapping for that plugin, so that extracted records are then mapped by the backend and ingested into gULP as usual.
 
-`--plugin` and `--mapping_parameters` must be provided using one of these forms:
+> `--mapping_parameters` follows the same exact format as when passed in [gulp](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-101) via `plugin_params`, and basically it is just forwarwed to the gulp `raw` plugin to perform ingestion with the given mapping.
+>
+> the only differences are the `mapping_file` and `additional_mapping_files` keys in the provided `mapping_parameters`:
+>
+> they are intented to be file paths in the local filesystem of `gulp-dissect` (since `gulp-dissect` is the one reading the mapping files and sending the mapping content to backend), so they are resolved and converted to direct JSON mappings by `gulp-dissect` before being sent to backend together with the provided `mapping_id`.
 
-#### tuples input on the command line
+~~~mermaid
+flowchart 
+  A[gulp-dissect CLI] -->|process mapping_parameters| B[extract with dissect plugin]
+  B --> C[generate GulpDocuments]
+  C --> D[call gulp]
+  D -->|ingest_raw| E[gULP backend]
+  E -->|apply mapping| F[mapped records in gULP]
+~~~
 
-One or more `--plugin` / `--mapping_parameters` pairs for multiple plugins (processed sequentially):
+`--plugin` and `--mapping_parameters` can be provided in two ways:
+
+#### mapping input via the command line
+
+One or more `--plugin` / `--mapping_parameters` pairs to perform extraction of (possibly) multiple data in one shot (processed sequentially):
 
 ```bash
 gulp-dissect \
@@ -103,29 +119,75 @@ gulp-dissect \
   --username admin --password admin \
   --gulp_url http://localhost:8080 \
   --operation_id test_operation \
-  --plugin evt --mapping_parameters '{"mappings":{"dissect_evt":{"exclude":["_generated","_version","_classification"],"fields":{"ts":{"ecs":["@timestamp"]},"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"},"_source":{"ecs":["log.file_path"]},"_version":{"ecs":["log.file_version"]}}}}}'
+  --plugin evt \
+  --mapping_parameters '{
+    "mappings":{
+      "dissect_evt":{
+        "exclude":[
+          "_generated","_version","_classification"
+        ],
+        "fields":{
+          "ts":{
+            "ecs":[
+              "@timestamp"
+            ]
+          },
+          "EventCode":{
+            "ecs":[
+              "event.code"
+            ]
+          },
+          "hostname":{
+            "is_gulp_type":"context_name"
+          },
+          "SourceName":{
+            "is_gulp_type":"source_name"
+          },
+          "_source":{
+            "ecs":["log.file_path"]
+          },
+          "_version":{
+            "ecs":["log.file_version"]
+          }
+        }
+      }
+    }
+  }'
   # others here ...
   # --plugin mft --mapping_parameters '...'
 ```
 
-#### tuples input from a JSON file
+#### mapping input via a JSON file
 
-a JSON file containing one or more tuples using `--extract_rules /path/to/extracts.json`.
+a JSON file containing an array of `plugin` and `mapping_parameters` objects (processed sequentially), to be passed via `--extract_rules` argument
+
+~~~json
+[
+  {
+    "plugin": "dissect_plugin_1", 
+    "mapping_parameters": { 
+      // ... 
+    }
+  },
+  {
+    "plugin": "dissect_plugin_2", 
+    "mapping_parameters": { 
+      // ... 
+    }
+  }
+]
+~~~
 
 [Example extract_rules](./extract_rules_sample.json)
 
-Run with file-based tuples:
+> if multiple mappings are specified (i.e. multiple mappings in `--mapping_parameters.mappings` and/or `--mapping_parameters.mapping_file`), they are merged together and sent to backend as a single object with multiple mapping ids.
+> thus, **it is important to specify the desired `mapping_id` to be applied**, or gulp will use the first mapping id it finds in the merged mapping object, which may not be the intended one.
 
-```bash
-gulp-dissect \
-  --image_path /gulp/img/SCHARDT.img \
-  --username admin --password admin \
-  --gulp_url http://localhost:8080 \
-  --operation_id test_operation \
-  --extract_rules ./extract_rules_sample.json
-```
+## examples
 
-Run with relative mapping files resolved from an explicit base path:
+provide a base directory for local mapping files, to look for `mapping_file` and `additional_mapping_files` paths in the provided mapping_parameters.
+
+> either, if set, they must be absolute parameters!
 
 ```bash
 gulp-dissect \
@@ -134,20 +196,13 @@ gulp-dissect \
   --gulp_url http://localhost:8080 \
   --operation_id test_operation \
   --plugin mft \
-  --mapping_parameters '{"mapping_file":"dissect_mft.json","mapping_id":"mft"}' \
-  --mapping_files_base_path /gulp/gulp-dissect/mapping_files
+  --mapping_parameters '{
+    "mapping_file":"dissect_mft.json",
+    "mapping_id":"mft"
+  }' --mapping_files_base_path /gulp/gulp-dissect/mapping_files
 ```
 
-`mapping_parameters` accepts either:
-
-- `{ "mapping_file": "/path/to/file.json", "mapping_id": "..." }`
-- `{ "mappings": { "id": { ...GulpMapping... } }, "mapping_id": "id" }`
-
-> if multiple mappings are present (i.e. multiple `mappings` keys in both `--mapping_parameters.mappings` or `--mapping_parameters.mapping_file`), they are merged together and sent to backend as a single object with multiple mapping ids: thus, the desired `mapping_id` to be applied must be specified to, or gulp will use the first mapping id it finds in the merged mapping object, which may not be the intended one.
-
-## examples
-
-applying value aliases
+mapping using [value_alieses](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-file-example) (processed by gulp)
 
 ~~~bash
 gulp-dissect \
@@ -156,7 +211,38 @@ gulp-dissect \
 --gulp_url http://localhost:8080 \
 --operation_id test_operation \
 --plugin evt \
---mapping_parameters '{"mappings":{"dissect_evt":{"value_aliases":{"event.code":{"default":{"1000":"bingo"}}},"fields":{"ts":{"ecs":["@timestamp"]},"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"}}}},"mapping_id":"dissect_evt"}' --limit 2 --reset-operation
+--mapping_parameters '{
+  "mappings": {
+    "dissect_evt":{
+      "value_aliases":{
+        "event.code":{
+          "default":{
+            "1000":"bingo"
+          }
+        }
+      },
+      "fields":{
+        "ts":{
+          "ecs":[
+            "@timestamp"
+          ]
+        },
+        "EventCode":{
+          "ecs":[
+            "event.code"
+          ]
+        },
+        "hostname":{
+          "is_gulp_type":"context_name"
+        },
+        "SourceName":{
+          "is_gulp_type":"source_name"
+        }
+      }
+    }
+  },
+  "mapping_id":"dissect_evt"
+}' --limit 2 --reset-operation
 ~~~
 
 ### filtering
@@ -190,37 +276,76 @@ gulp-dissect \
 --gulp_url http://localhost:8080 \
 --operation_id test_operation \
 --plugin evt \
---mapping_parameters '{"mappings":{"dissect_evt":{"value_aliases":{"event.code":{"default":{"1000":"bingo"}}},"fields":{"ts":{"ecs":["@timestamp"]},"EventCode":{"ecs":["event.code"]},"hostname":{"is_gulp_type":"context_name"},"SourceName":{"is_gulp_type":"source_name"}}}},"mapping_id":"dissect_evt"}' --flt '{"EventCode":1000}' --reset-operation
+--mapping_parameters '{
+  "mappings":{
+    "dissect_evt":{
+      "value_aliases":{
+        "event.code":{
+          "default":{
+            "1000":"bingo"
+          }
+        }
+      },
+      "fields":{
+        "ts":{
+          "ecs":[
+            "@timestamp"
+          ]
+        },
+        "EventCode":{
+          "ecs":[
+            "event.code"
+          ]
+        },
+        "hostname":{
+          "is_gulp_type":"context_name"
+        },
+        "SourceName":{
+          "is_gulp_type":"source_name"
+        }
+      }
+    }
+  },
+  "mapping_id":"dissect_evt"
+}' --flt '{"EventCode":1000}' --reset-operation
 ```
 
-> in the example above, filtering is applied locally on raw data, then value_aliases is applied by the backend. So if you want to filter by an aliased value, you need to use the original value in the filter condition, not the alias.
+> in the example above, filtering is applied locally on raw data, then `value_aliases` is applied by the backend.
+>
+> So if you want to filter by an aliased value, you need to use the original value in the filter condition, not the alias.
 
 Filter by numeric equality:
 
 ```bash
---flt '{"Severity":3}'
+--flt '{
+  "Severity":3
+}'
 ```
 
 Filter by numeric range:
 
 ```bash
---flt '{"Severity":{"gte":3,"lte":5}}'
+--flt '{
+  "Severity":{
+    "gte":3,
+    "lte":5
+  }
+}'
 ```
 
 Combine time range and raw fields (AND):
 
 ```bash
- --flt '{"time_range": ["2004-08-20T15:25:39+00:00","2004-08-20T15:45:39+00:00"],"Channel":"Security","Severity":{"gte":3}}'
+ --flt '{
+  "time_range": [
+    "2004-08-20T15:25:39+00:00",
+    "2004-08-20T15:45:39+00:00"
+  ],
+  "Channel":"Security",
+  "Severity":{
+    "gte":3
+  }
+}'
 ```
 
-> `time_range` is evaluated against "ts", which is the default timestamp key used by dissect, and **must be specified as an ISO8601 string**.
-
-## Mapping Behavior
-
-mapping is performed on the backend as usual, applying the given mapping to the `raw` plugin.
-
-specifically:
-
-1. any `mapping_file` or `additional_mapping_files` provided in `GulpMappingParameters` are cleared, converted to direct json mappings and set in `plugin_params.mapping_parameters.mappings` prior to sending to backend together with the provided `mapping_id`.
-2. Extracted records are sent as raw payloads to backend and handled by the `raw` plugin for ingestion.
-3. backend then applies the mapping as usual during ingestion.
+> `time_range` is evaluated against "ts", which is the default timestamp key used by dissect, and **must be specified as an ISO8601 string or directly as a nanoseconds-from-unix-epoch value**.
