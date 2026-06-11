@@ -533,7 +533,9 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_to_jsonable(v) for v in value]
+        # treat as string
+        return str(value)
+        # return [_to_jsonable(v) for v in value]
     return str(value)
 
 
