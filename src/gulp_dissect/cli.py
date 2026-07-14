@@ -71,6 +71,7 @@ class AppConfig:
         limit: Global maximum number of accepted documents to ingest; `0` means
             unlimited and is translated to `None` during runtime.
         chunk_size: Maximum documents sent per `/ingest_raw` request.
+        concurrency: Maximum non-final chunks processed concurrently.
         context_name: Optional explicit context name override resolved (or
             created) on gULP and written as `gulp.context_id`.
         source_name: Optional explicit source name override resolved (or
@@ -89,6 +90,7 @@ class AppConfig:
     operation_id: str
     limit: int
     chunk_size: int
+    concurrency: int
     context_name: str | None
     source_name: str | None
     mapping_files_base_path: str | None
@@ -218,10 +220,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--chunk_size",
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="number of mapped records sent per ingest_raw chunk (default=1000)",
+    )
+    p.add_argument(
+        "--concurrency",
         type=int,
         default=None,
-        help="number of mapped records sent per ingest_raw chunk",
+        help="maximum concurrent ingest_raw chunks, default=4",
     )
     p.add_argument(
         "--context_name",
@@ -324,7 +332,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     gulp_url = _env_or_arg(args.gulp_url, "GULP_DISSECT_URL")
     operation_id = args.operation_id
     limit_raw = args.limit if args.limit is not None else 0
-    chunk_size_raw = args.chunk_size if args.chunk_size is not None else 1000
+    concurrency_raw = args.concurrency if args.concurrency is not None else 4
     context_name = args.context_name
     source_name = args.source_name
     mapping_files_base_path = _env_or_arg(
@@ -360,9 +368,12 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     if limit < 0:
         raise ValueError("limit must be >= 0")
 
-    chunk_size = int(chunk_size_raw)
+    chunk_size = int(args.chunk_size)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
+    concurrency = int(concurrency_raw)
+    if concurrency <= 0:
+        raise ValueError("concurrency must be > 0")
 
     return AppConfig(
         image_path=str(image_path),
@@ -372,6 +383,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         operation_id=str(operation_id),
         limit=limit,
         chunk_size=chunk_size,
+        concurrency=concurrency,
         context_name=str(context_name) if context_name else None,
         source_name=str(source_name) if source_name else None,
         mapping_files_base_path=(
@@ -757,25 +769,26 @@ async def ingest_spec(
 
     req_id = str(uuid.uuid4())
     chunk: list[dict[str, Any]] = []
+    pending: list[asyncio.Task[None]] = []
     accepted_total = 0
     total = 0
     progress = None if cfg.verbose else _make_progress_bar(spec)
 
-    async def _flush(last: bool) -> None:
-        """Send the current chunk to `/ingest_raw` and clear local buffer."""
-        if not chunk:
-            return
+    async def _send(payload: list[dict[str, Any]], last: bool) -> None:
+        """Send one chunk to `/ingest_raw`."""
         result = await client.ingest.raw(
             operation_id=cfg.operation_id,
             plugin_name="raw",
-            data=chunk,
+            data=payload,
             params={
                 "req_id": req_id,
                 "last": last,
+                "ws_id": None,
                 "plugin_params": {
                     "mapping_parameters": deepcopy(spec.mapping_parameters),
                 },
             },
+            wait_for_worker=True,
             wait=last,
             timeout=3600,
         )
@@ -784,7 +797,27 @@ async def ingest_spec(
             raise RuntimeError(
                 f"ingest_raw request failed for plugin '{spec.plugin}' with status='{status}', req_id='{req_id}'"
             )
+
+    async def _wait_pending() -> None:
+        """Wait for the current bounded batch and propagate its first error."""
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        pending.clear()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _flush(last: bool) -> None:
+        """Queue a non-final chunk, or drain the batch before the final one."""
+        payload = chunk.copy()
         chunk.clear()
+        if last:
+            await _wait_pending()
+            await _send(payload, last=True)
+            return
+
+        pending.append(asyncio.create_task(_send(payload, last=False)))
+        if len(pending) >= cfg.concurrency:
+            await _wait_pending()
 
     try:
         for raw_record in iter_plugin_records(target, spec.plugin):
@@ -808,13 +841,15 @@ async def ingest_spec(
             elif progress is not None:
                 progress.update(1)
 
-            chunk.append(to_send)
             if len(chunk) >= cfg.chunk_size:
                 await _flush(last=False)
+            chunk.append(to_send)
 
         if chunk:
             await _flush(last=True)
     finally:
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if progress is not None:
             progress.close()
 
@@ -837,7 +872,7 @@ async def run(cfg: AppConfig, specs: list[ResolvedExtractSpec]) -> None:
     High-level flow:
 
     - open target image
-    - authenticate to gULP and ensure websocket session
+    - authenticate to gULP
     - optionally reset operation
     - ingest each extract spec sequentially while enforcing global `--limit`
     - attempt logout in finally block
@@ -845,9 +880,8 @@ async def run(cfg: AppConfig, specs: list[ResolvedExtractSpec]) -> None:
 
     target = Target.open(cfg.image_path)
 
-    async with GulpClient(cfg.gulp_url) as client:
+    async with GulpClient(cfg.gulp_url, ws_auto_connect=False) as client:
         await client.auth.login(cfg.username, cfg.password)
-        await client.ensure_websocket()
         try:
             remaining_limit: int | None = cfg.limit if cfg.limit > 0 else None
 

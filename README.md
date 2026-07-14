@@ -36,7 +36,8 @@ pip install -e .
 
 2026-05-23 17:28:24,623|gulp-dissect||DEBUG|28599,28599|_reconfigure|"muty/log.py", line 245|logger "<TraceLogger gulp-dissect (DEBUG)>" configured!
 usage: gulp-dissect [-h] [--version] [--image_path IMAGE_PATH] [--username USERNAME] [--password PASSWORD] [--gulp_url GULP_URL]
-                    [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk_size CHUNK_SIZE] [--context_name CONTEXT_NAME]
+                    [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk-size CHUNK_SIZE] [--concurrency CONCURRENCY]
+                    [--context_name CONTEXT_NAME]
                     [--source_name SOURCE_NAME] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT]
                     [--reset-operation] [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS]
                     [--extract_rules EXTRACT_RULES]
@@ -54,8 +55,10 @@ options:
   --operation_id OPERATION_ID
                         existing gULP operation id where documents will be ingested (default: None)
   --limit LIMIT         maximum number of records to ingest across all extract tuples; 0 means no limit (default: None)
-  --chunk_size CHUNK_SIZE
-                        number of mapped records sent per ingest_raw chunk (default: None)
+  --chunk-size CHUNK_SIZE
+                        number of mapped records sent per ingest_raw chunk (default: 1000)
+  --concurrency CONCURRENCY
+                        maximum concurrent non-final ingest_raw chunks (default: None)
   --context_name CONTEXT_NAME
                         explicit context name override; if omitted, mapping must provide an is_gulp_type=context_name field
                         (default: None)
@@ -199,7 +202,7 @@ gulp-dissect \
   --mapping_parameters '{
     "mapping_file":"dissect_mft.json",
     "mapping_id":"mft"
-  }' --mapping_files_base_path /gulp/gulp-dissect/mapping_files
+  }' --mapping_files_base_path /gulp/gulp-dissect/mapping_file_samples
 ```
 
 mapping using [value_alieses](https://github.com/mentat-is/gulp/blob/master/docs/plugins_and_mapping.md#mapping-file-example) (processed by gulp)
@@ -221,6 +224,9 @@ gulp-dissect \
           }
         }
       },
+      "exclude":[
+        "_generated","_version","_classification", "_source"
+      ],
       "fields":{
         "ts":{
           "ecs":[
@@ -286,6 +292,9 @@ gulp-dissect \
           }
         }
       },
+      "exclude":[
+        "_generated","_version","_classification", "_source"
+      ],
       "fields":{
         "ts":{
           "ecs":[

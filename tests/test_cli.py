@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from gulp.api.opensearch.filters import GulpIngestionFilter
@@ -8,6 +9,7 @@ from gulp.api.opensearch.filters import GulpIngestionFilter
 from gulp_dissect.cli import (
     _passes_ingestion_filter,
     AppConfig,
+    ResolvedExtractSpec,
     build_config,
     collect_extract_specs,
     get_app_version,
@@ -28,6 +30,7 @@ def _cfg(context_name=None, source_name=None):
         operation_id="test_operation",
         limit=0,
         chunk_size=1000,
+        concurrency=4,
         context_name=context_name,
         source_name=source_name,
         mapping_files_base_path=None,
@@ -255,6 +258,7 @@ def test_build_config_defaults_to_unlimited_limit():
     )
     cfg = build_config(args)
     assert cfg.limit == 0
+    assert cfg.chunk_size == 10_000
 
 
 def test_build_config_sets_limit_from_cli():
@@ -623,13 +627,23 @@ class _FakeIngestApi:
     def __init__(self):
         self.calls = []
 
-    async def raw(self, operation_id, plugin_name, data, params, wait, timeout):
+    async def raw(
+        self,
+        operation_id,
+        plugin_name,
+        data,
+        params,
+        wait_for_worker,
+        wait,
+        timeout,
+    ):
         self.calls.append(
             {
                 "operation_id": operation_id,
                 "plugin_name": plugin_name,
                 "data": list(data),
                 "params": params,
+                "wait_for_worker": wait_for_worker,
                 "wait": wait,
                 "timeout": timeout,
             }
@@ -649,6 +663,54 @@ class _FakeIngestClient:
 class _FakeFullClient:
     def __init__(self):
         self.ingest = _FakeIngestApi()
+
+
+@pytest.mark.asyncio
+async def test_ingest_spec_bounds_parallel_chunks_and_sends_last_after_barrier(
+    monkeypatch,
+):
+    from gulp_dissect import cli as cli_module
+
+    active = 0
+    max_active = 0
+    completed_nonfinal = 0
+    last_flags: list[bool] = []
+
+    class _Ingest:
+        async def raw(self, **kwargs):
+            nonlocal active, max_active, completed_nonfinal
+            last = kwargs["params"]["last"]
+            last_flags.append(last)
+            active += 1
+            max_active = max(max_active, active)
+            if last:
+                assert completed_nonfinal == 4
+            await asyncio.sleep(0)
+            active -= 1
+            if not last:
+                completed_nonfinal += 1
+            return SimpleNamespace(status="success")
+
+    monkeypatch.setattr(
+        cli_module,
+        "iter_plugin_records",
+        lambda target, plugin: iter({"id": i} for i in range(5)),
+    )
+    cfg = _cfg()
+    cfg.chunk_size = 1
+    cfg.concurrency = 2
+    cfg.verbose = True
+
+    ingested = await ingest_spec(
+        SimpleNamespace(ingest=_Ingest()),
+        cfg,
+        target=None,
+        spec=ResolvedExtractSpec(plugin="evt", mapping_id="m1"),
+    )
+
+    assert ingested == 5
+    assert max_active == 2
+    assert last_flags == [False, False, False, False, True]
 
 
 @pytest.mark.asyncio
@@ -700,6 +762,8 @@ async def test_ingest_spec_applies_local_filter_and_does_not_forward_flt(monkeyp
     assert client.ingest.calls[0]["data"][0]["gulp.source_id"] == "src-fixed"
     assert "flt" not in client.ingest.calls[0]["params"]
     assert "plugin_params" in client.ingest.calls[0]["params"]
+    assert client.ingest.calls[0]["params"]["ws_id"] is None
+    assert client.ingest.calls[0]["wait_for_worker"] is True
 
 
 @pytest.mark.asyncio

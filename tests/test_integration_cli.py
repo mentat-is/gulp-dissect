@@ -67,7 +67,7 @@ def test_cli_plan_evt_workflow():
             "--limit",
             str(_LIMITED_EVT_DOC_COUNT),
             "--reset-operation",
-            "--chunk_size",
+            "--chunk-size",
             "1000",
             "--plugin",
             "evt",

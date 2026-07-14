@@ -6,6 +6,12 @@
     },
     "mappings": {
         "default": {
+            "exclude": [
+                "_generated",
+                "_version",
+                "_source",
+                "_classification"
+            ],
             "fields": {
                 "SourceFile": {
                     "ecs": [
@@ -17,6 +23,12 @@
             "event_code": "default"
         },
         "mft": {
+            "exclude": [
+                "_generated",
+                "_version",
+                "_source",
+                "_classification"
+            ],
             "fields": {
                 "ts": {
                     "ecs": [
