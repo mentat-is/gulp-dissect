@@ -258,7 +258,8 @@ def test_build_config_defaults_to_unlimited_limit():
     )
     cfg = build_config(args)
     assert cfg.limit == 0
-    assert cfg.chunk_size == 10_000
+    assert cfg.chunk_size == 1000
+    assert cfg.concurrency == 4
 
 
 def test_build_config_sets_limit_from_cli():
@@ -697,39 +698,44 @@ class _FakeFullClient:
 
 
 @pytest.mark.asyncio
-async def test_ingest_spec_bounds_parallel_chunks_and_sends_last_after_barrier(
+async def test_ingest_spec_batches_nonfinal_chunks_and_sends_final_batch_serially(
     monkeypatch,
 ):
     from gulp_dissect import cli as cli_module
 
     active = 0
     max_active = 0
-    completed_nonfinal = 0
+    completed = 0
     last_flags: list[bool] = []
 
     class _Ingest:
         async def raw(self, **kwargs):
-            nonlocal active, max_active, completed_nonfinal
+            nonlocal active, max_active, completed
+            record_id = kwargs["data"][0]["id"]
             last = kwargs["params"]["last"]
             last_flags.append(last)
+            assert kwargs["wait_for_worker"] is True
+            if record_id in {3, 6, 7}:
+                assert completed == record_id
+            if record_id >= 6:
+                assert active == 0
             active += 1
             max_active = max(max_active, active)
             if last:
-                assert completed_nonfinal == 4
+                assert record_id == 7
             await asyncio.sleep(0)
             active -= 1
-            if not last:
-                completed_nonfinal += 1
+            completed += 1
             return SimpleNamespace(status="success")
 
     monkeypatch.setattr(
         cli_module,
         "iter_plugin_records",
-        lambda target, plugin: iter({"id": i} for i in range(5)),
+        lambda target, plugin: iter({"id": i} for i in range(8)),
     )
     cfg = _cfg()
     cfg.chunk_size = 1
-    cfg.concurrency = 2
+    cfg.concurrency = 3
     cfg.verbose = True
 
     ingested = await ingest_spec(
@@ -739,9 +745,9 @@ async def test_ingest_spec_bounds_parallel_chunks_and_sends_last_after_barrier(
         spec=ResolvedExtractSpec(plugin="evt", mapping_id="m1"),
     )
 
-    assert ingested == 5
-    assert max_active == 2
-    assert last_flags == [False, False, False, False, True]
+    assert ingested == 8
+    assert max_active == 3
+    assert last_flags == [False] * 7 + [True]
 
 
 @pytest.mark.asyncio

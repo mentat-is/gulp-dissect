@@ -59,7 +59,7 @@ options:
   --chunk-size CHUNK_SIZE
                         number of mapped records sent per ingest_raw chunk (default: 1000)
   --concurrency CONCURRENCY
-                        maximum concurrent non-final ingest_raw chunks (default: None)
+                        maximum concurrent non-final ingest_raw chunks (default: 4)
   --context_name CONTEXT_NAME
                         explicit context name override; if omitted, mapping must provide an is_gulp_type=context_name field
                         (default: None)
@@ -91,6 +91,8 @@ Environment variables are supported only for:
 - `--mapping_files_base_path` (env `GULP_DISSECT_MAPPING_FILES_BASE_PATH`)
 
 All other options are command-line only.  
+
+Each full batch sends `--concurrency` chunks concurrently and finishes before the next batch starts. Requests in the final batch are sent serially, with `last=true` set only on the final request.
 
 Default exclusions ensure every mapping's `exclude` list contains `_generated`, `_version`, `_source`, and `_classification` before the mapping is sent to gULP, preserving any existing exclusions. Use `--no-default-excludes` to disable this behavior.
 

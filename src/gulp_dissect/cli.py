@@ -233,8 +233,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--concurrency",
         type=int,
-        default=None,
-        help="maximum concurrent ingest_raw chunks, default=4",
+        default=4,
+        help="maximum concurrent non-final ingest_raw chunks",
     )
     p.add_argument(
         "--context_name",
@@ -343,7 +343,6 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     gulp_url = _env_or_arg(args.gulp_url, "GULP_DISSECT_URL")
     operation_id = args.operation_id
     limit_raw = args.limit if args.limit is not None else 0
-    concurrency_raw = args.concurrency if args.concurrency is not None else 4
     context_name = args.context_name
     source_name = args.source_name
     mapping_files_base_path = _env_or_arg(
@@ -382,10 +381,9 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     chunk_size = int(args.chunk_size)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
-    concurrency = int(concurrency_raw)
+    concurrency = int(args.concurrency)
     if concurrency <= 0:
         raise ValueError("concurrency must be > 0")
-
     return AppConfig(
         image_path=str(image_path),
         username=str(username),
@@ -786,7 +784,7 @@ async def ingest_spec(
 
     req_id = str(uuid.uuid4())
     chunk: list[dict[str, Any]] = []
-    pending: list[asyncio.Task[None]] = []
+    batch: list[list[dict[str, Any]]] = []
     accepted_total = 0
     total = 0
     progress = None if cfg.verbose else _make_progress_bar(spec)
@@ -815,26 +813,33 @@ async def ingest_spec(
                 f"ingest_raw request failed for plugin '{spec.plugin}' with status='{status}', req_id='{req_id}'"
             )
 
-    async def _wait_pending() -> None:
-        """Wait for the current bounded batch and propagate its first error."""
-        results = await asyncio.gather(*pending, return_exceptions=True)
-        pending.clear()
+    async def _send_concurrent_batch(
+        payloads: list[list[dict[str, Any]]],
+    ) -> None:
+        """Send a complete non-final batch and propagate worker errors."""
+        results = await asyncio.gather(
+            *(_send(payload, last=False) for payload in payloads),
+            return_exceptions=True,
+        )
         for result in results:
             if isinstance(result, BaseException):
                 raise result
 
     async def _flush(last: bool) -> None:
-        """Queue a non-final chunk, or drain the batch before the final one."""
-        payload = chunk.copy()
+        """Add a chunk to a concurrent batch or send the final batch serially."""
+        batch.append(chunk.copy())
         chunk.clear()
-        if last:
-            await _wait_pending()
-            await _send(payload, last=True)
+        if not last:
+            if len(batch) == cfg.concurrency:
+                payloads = batch.copy()
+                batch.clear()
+                await _send_concurrent_batch(payloads)
             return
 
-        pending.append(asyncio.create_task(_send(payload, last=False)))
-        if len(pending) >= cfg.concurrency:
-            await _wait_pending()
+        for payload in batch[:-1]:
+            await _send(payload, last=False)
+        await _send(batch[-1], last=True)
+        batch.clear()
 
     try:
         for raw_record in iter_plugin_records(target, spec.plugin):
@@ -865,8 +870,6 @@ async def ingest_spec(
         if chunk:
             await _flush(last=True)
     finally:
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
         if progress is not None:
             progress.close()
 
