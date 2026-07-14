@@ -537,6 +537,37 @@ def test_resolve_specs_preserves_inline_mapping_parameters():
     ] == ["event.code"]
 
 
+def test_resolve_specs_sets_default_excludes_on_every_mapping():
+    cfg = _cfg()
+    assert parse_args([]).default_excludes is True
+    assert parse_args(["--no-default-excludes"]).default_excludes is False
+    resolved = _resolve_specs(
+        [
+            {
+                "plugin": "evt",
+                "mapping_parameters": {
+                    "mappings": {
+                        "m1": {"fields": {}},
+                        "m2": {"exclude": ["custom", "_source"], "fields": {}},
+                    }
+                },
+            }
+        ],
+        cfg,
+    )
+
+    mappings = resolved[0].mapping_parameters["mappings"]
+    defaults = ["_generated", "_version", "_source", "_classification"]
+    assert mappings["m1"]["exclude"] == defaults
+    assert mappings["m2"]["exclude"] == [
+        "custom",
+        "_source",
+        "_generated",
+        "_version",
+        "_classification",
+    ]
+
+
 def test_resolve_specs_normalizes_mapping_file_paths(tmp_path: Path):
     base_path = tmp_path / "mappings"
     base_path.mkdir()

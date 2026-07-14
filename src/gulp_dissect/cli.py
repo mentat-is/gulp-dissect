@@ -50,6 +50,8 @@ from tqdm import tqdm
 from gulp_dissect import __version__
 from gulp.structs import GulpMappingParameters
 
+DEFAULT_EXCLUDES = ["_generated", "_version", "_source", "_classification"]
+
 # ---------------------------------------------------------------------------
 # Data classes for configuration and resolved extract specifications.
 # ---------------------------------------------------------------------------
@@ -79,6 +81,8 @@ class AppConfig:
         mapping_files_base_path: Optional base path used to resolve relative
             mapping file paths in mapping parameters.
         flt: Optional client-side ingestion filter (`GulpIngestionFilter`).
+        default_excludes: Whether to set the standard internal-field exclusions
+            on every mapping sent to gULP.
         reset_operation: Whether to delete/recreate the operation before ingest.
         verbose: Whether to print mapped documents instead of showing progress.
     """
@@ -97,6 +101,7 @@ class AppConfig:
     flt: GulpIngestionFilter | None
     reset_operation: bool
     verbose: bool
+    default_excludes: bool = True
 
 
 @dataclass
@@ -260,6 +265,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--no-default-excludes",
+        dest="default_excludes",
+        action="store_false",
+        help="do not add the standard internal-field exclusions to mappings",
+    )
+    p.add_argument(
         "--reset-operation",
         action="store_true",
         help=(
@@ -392,6 +403,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         flt=flt,
         reset_operation=str(reset_operation_raw).lower() in {"1", "true", "yes", "on"},
         verbose=bool(args.verbose),
+        default_excludes=bool(args.default_excludes),
     )
 
 
@@ -519,6 +531,11 @@ async def resolve_specs(
             mp_dict,
             cfg.mapping_files_base_path,
         )
+        if cfg.default_excludes:
+            for mapping in normalized_mapping_parameters["mappings"].values():
+                mapping["exclude"].extend(
+                    value for value in DEFAULT_EXCLUDES if value not in mapping["exclude"]
+                )
         resolved.append(
             ResolvedExtractSpec(
                 plugin=str(plugin),

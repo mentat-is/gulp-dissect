@@ -39,7 +39,8 @@ usage: gulp-dissect [-h] [--version] [--image_path IMAGE_PATH] [--username USERN
                     [--operation_id OPERATION_ID] [--limit LIMIT] [--chunk-size CHUNK_SIZE] [--concurrency CONCURRENCY]
                     [--context_name CONTEXT_NAME]
                     [--source_name SOURCE_NAME] [--mapping_files_base_path MAPPING_FILES_BASE_PATH] [--flt FLT]
-                    [--reset-operation] [--verbose] [--plugin PLUGIN] [--mapping_parameters MAPPING_PARAMETERS]
+                    [--no-default-excludes] [--reset-operation] [--verbose] [--plugin PLUGIN]
+                    [--mapping_parameters MAPPING_PARAMETERS]
                     [--extract_rules EXTRACT_RULES]
 
 Extract data from a forensic image with Dissect and ingest mapped records into gULP via ingest_raw.
@@ -69,6 +70,8 @@ options:
                         base path used to resolve relative mapping file paths (or set GULP_DISSECT_MAPPING_FILES_BASE_PATH)
                         (default: None)
   --flt FLT             optional GulpIngestionFilter JSON object applied client-side before ingest_raw calls (default: None)
+  --no-default-excludes
+                        do not add the standard internal-field exclusions to mappings (default: True)
   --reset-operation     delete and recreate the target operation before ingestion (destructive) (default: False)
   --verbose             print each mapped GulpDocument as JSON instead of showing the progress bar (default: False)
   --plugin PLUGIN       Dissect plugin/function name for one extract tuple; repeat with --mapping_parameters (default: [])
@@ -88,6 +91,8 @@ Environment variables are supported only for:
 - `--mapping_files_base_path` (env `GULP_DISSECT_MAPPING_FILES_BASE_PATH`)
 
 All other options are command-line only.  
+
+Default exclusions ensure every mapping's `exclude` list contains `_generated`, `_version`, `_source`, and `_classification` before the mapping is sent to gULP, preserving any existing exclusions. Use `--no-default-excludes` to disable this behavior.
 
 When `--context_name` and/or `--source_name` are provided, each value is treated as a context/source name override: gULP resolves it via `context_create` / `source_create` (creating it if missing), and the resulting ids are used in generated documents.
 
